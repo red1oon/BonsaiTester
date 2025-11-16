@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+BonsaiTester - Main CLI Entry Point
+====================================
+
+Fast, headless testing for Bonsai BIM databases.
+
+Usage:
+    bonsai-test --fast database.db           # Tier 1 only (schema)
+    bonsai-test --geometry database.db       # Tier 1 + 2 (schema + geometry)
+    bonsai-test --full database.db           # All tiers (includes Blender)
+
+    bonsai-test --sample 100 database.db     # Test random 100 elements
+    bonsai-test --verbose database.db        # Detailed output
+
+Author: Redhuan D. Oon <red1org@gmail.com>
+License: LGPL-3.0
+"""
+
+import sys
+import time
+import argparse
+from pathlib import Path
+
+# Add bonsai_tester to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from bonsai_tester.validators.geometry_validator import validate_database_geometries
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='BonsaiTester - Headless validation for Bonsai BIM databases',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s database.db                    # Quick geometry validation
+  %(prog)s --fast database.db             # Schema only (fastest)
+  %(prog)s --sample 50 database.db        # Test 50 random elements
+  %(prog)s --verbose database.db          # Detailed output
+
+Tiers:
+  Tier 1 (--fast):     Database schema validation (< 5s)
+  Tier 2 (default):    Geometry validation (10-20s)
+  Tier 3 (--full):     Visual validation with Blender (30-60s)
+        """
+    )
+
+    parser.add_argument('database', type=Path, help='Path to Bonsai database (.db file)')
+
+    # Test modes
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--fast', action='store_true',
+                           help='Tier 1 only: Schema validation (fastest)')
+    mode_group.add_argument('--geometry', action='store_true',
+                           help='Tier 1 + 2: Schema + geometry validation (default)')
+    mode_group.add_argument('--full', action='store_true',
+                           help='All tiers: Schema + geometry + visual (requires Blender)')
+
+    # Options
+    parser.add_argument('--sample', type=int, metavar='N',
+                       help='Validate random sample of N elements (default: all)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Print detailed validation results')
+    parser.add_argument('--version', action='version', version='BonsaiTester 0.1.0')
+
+    args = parser.parse_args()
+
+    # Check database exists
+    if not args.database.exists():
+        print(f"❌ Database not found: {args.database}")
+        return 1
+
+    # Determine mode (default: geometry)
+    if args.fast:
+        mode = 'fast'
+    elif args.full:
+        mode = 'full'
+    else:
+        mode = 'geometry'  # Default
+
+    # Print header
+    print("=" * 70)
+    print("BONSAI TESTER v0.1.0")
+    print("=" * 70)
+    print(f"Database: {args.database}")
+    print(f"Size: {args.database.stat().st_size / (1024**2):.1f} MB")
+    print(f"Mode: {mode.upper()}")
+    if args.sample:
+        print(f"Sample: {args.sample} elements")
+    print("=" * 70)
+
+    start_time = time.time()
+
+    # Run tests based on mode
+    if mode == 'fast':
+        print("\n[Tier 1: Schema Validation] - NOT YET IMPLEMENTED")
+        print("Coming soon: Database schema and integrity checks")
+        return 0
+
+    elif mode == 'geometry':
+        print("\n[Tier 2: Geometry Validation]")
+        results = validate_database_geometries(
+            args.database,
+            sample_size=args.sample,
+            verbose=args.verbose
+        )
+
+        elapsed = time.time() - start_time
+
+        print(f"\n{'=' * 70}")
+        print("VALIDATION SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"Total geometries: {results['total']:,}")
+        print(f"Validated: {results['validated']:,}")
+        print(f"✓ Passed: {results['passed']:,}")
+        print(f"✗ Failed: {results['failed']:,}")
+        print(f"Time: {elapsed:.1f} seconds")
+        print(f"{'=' * 70}")
+
+        if results['failed'] > 0:
+            print(f"\n❌ VALIDATION FAILED - {results['failed']} geometry errors")
+            print("\nFirst 10 failures:")
+            for failure in results['failures'][:10]:
+                print(f"  • {failure['guid']}:")
+                for msg in failure['failures']:
+                    print(f"    └─ {msg}")
+            return 1
+        else:
+            print("\n✅ ALL GEOMETRIES VALID")
+            return 0
+
+    elif mode == 'full':
+        print("\n[Tier 1: Schema Validation] - NOT YET IMPLEMENTED")
+        print("[Tier 2: Geometry Validation] - Running...")
+
+        results = validate_database_geometries(
+            args.database,
+            sample_size=args.sample,
+            verbose=args.verbose
+        )
+
+        print(f"  ✓ Passed: {results['passed']:,}")
+        print(f"  ✗ Failed: {results['failed']:,}")
+
+        print("\n[Tier 3: Visual Validation] - NOT YET IMPLEMENTED")
+        print("Coming soon: Blender background mode snapshot testing")
+
+        elapsed = time.time() - start_time
+        print(f"\nTotal time: {elapsed:.1f} seconds")
+
+        return 0 if results['failed'] == 0 else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
