@@ -72,7 +72,15 @@ Tiers:
 
     # Check database exists
     if not args.database.exists():
-        print(f"❌ Database not found: {args.database}")
+        if args.json:
+            error_output = {
+                'error': 'Database not found',
+                'database': str(args.database),
+                'success': False
+            }
+            print(json.dumps(error_output, indent=2))
+        else:
+            print(f"❌ Database not found: {args.database}")
         return 1
 
     # Determine mode (default: geometry)
@@ -83,16 +91,17 @@ Tiers:
     else:
         mode = 'geometry'  # Default
 
-    # Print header
-    print("=" * 70)
-    print("BONSAI TESTER v0.1.0")
-    print("=" * 70)
-    print(f"Database: {args.database}")
-    print(f"Size: {args.database.stat().st_size / (1024**2):.1f} MB")
-    print(f"Mode: {mode.upper()}")
-    if args.sample:
-        print(f"Sample: {args.sample} elements")
-    print("=" * 70)
+    # Print header (skip if JSON mode)
+    if not args.json:
+        print("=" * 70)
+        print("BONSAI TESTER v0.1.0")
+        print("=" * 70)
+        print(f"Database: {args.database}")
+        print(f"Size: {args.database.stat().st_size / (1024**2):.1f} MB")
+        print(f"Mode: {mode.upper()}")
+        if args.sample:
+            print(f"Sample: {args.sample} elements")
+        print("=" * 70)
 
     start_time = time.time()
 

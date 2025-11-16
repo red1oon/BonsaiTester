@@ -321,7 +321,7 @@ def validate_normals(normals: List[Tuple[float, float, float]],
 def parse_geometry(guid: str,
                    vertices_blob: bytes,
                    faces_blob: bytes,
-                   normals_blob: bytes) -> GeometryStats:
+                   normals_blob: Optional[bytes]) -> GeometryStats:
     """
     Parse geometry blobs and compute statistics.
 
@@ -329,7 +329,7 @@ def parse_geometry(guid: str,
         guid: Element GUID
         vertices_blob: Binary vertex data
         faces_blob: Binary face data
-        normals_blob: Binary normal data
+        normals_blob: Binary normal data (optional, can be None)
 
     Returns:
         GeometryStats with parsed data and statistics
@@ -340,7 +340,12 @@ def parse_geometry(guid: str,
     # Unpack blobs
     vertices = unpack_vertices(vertices_blob)
     faces = unpack_faces(faces_blob)
-    normals = unpack_normals(normals_blob)
+
+    # Normals are optional in some databases
+    if normals_blob and len(normals_blob) > 0:
+        normals = unpack_normals(normals_blob)
+    else:
+        normals = []  # No normals available
 
     # Compute bounding box
     bbox_min, bbox_max = compute_bounding_box(vertices)
@@ -354,9 +359,13 @@ def parse_geometry(guid: str,
     degenerate_result = detect_degenerate_faces(vertices, faces)
     has_degenerate = not degenerate_result.passed
 
-    # Validate normals
-    normals_result = validate_normals(normals, len(faces))
-    normals_valid = normals_result.passed
+    # Validate normals (if present)
+    if normals:
+        normals_result = validate_normals(normals, len(faces))
+        normals_valid = normals_result.passed
+    else:
+        # No normals in database - this is OK for some schemas
+        normals_valid = True
 
     return GeometryStats(
         guid=guid,
@@ -370,14 +379,14 @@ def parse_geometry(guid: str,
         normals_valid=normals_valid,
         vertices_blob_size=len(vertices_blob),
         faces_blob_size=len(faces_blob),
-        normals_blob_size=len(normals_blob)
+        normals_blob_size=len(normals_blob) if normals_blob else 0
     )
 
 
 def validate_geometry_blob(guid: str,
                            vertices_blob: bytes,
                            faces_blob: bytes,
-                           normals_blob: bytes,
+                           normals_blob: Optional[bytes],
                            expected_bbox: Optional[Tuple[float, float, float]] = None,
                            verbose: bool = False) -> List[ValidationResult]:
     """
@@ -436,17 +445,25 @@ def validate_geometry_blob(guid: str,
                 message="Degenerate faces detected"
             ))
 
-        # Validation 5: Normals
-        if stats.normals_valid:
-            results.append(ValidationResult(
-                passed=True,
-                message=f"Normals valid: {stats.normal_count} unit-length vectors"
-            ))
+        # Validation 5: Normals (optional)
+        if stats.normal_count > 0:
+            if stats.normals_valid:
+                results.append(ValidationResult(
+                    passed=True,
+                    message=f"Normals valid: {stats.normal_count} unit-length vectors"
+                ))
+            else:
+                results.append(ValidationResult(
+                    passed=False,
+                    message="Normal validation failed"
+                ))
         else:
-            results.append(ValidationResult(
-                passed=False,
-                message="Normal validation failed"
-            ))
+            # No normals - this is OK, skip validation
+            if verbose:
+                results.append(ValidationResult(
+                    passed=True,
+                    message="Normals not present (OK for some schemas)"
+                ))
 
         # Validation 6: Bounding box sanity check
         bbox_size = stats.bbox_size
@@ -521,9 +538,36 @@ def validate_database_geometries(db_path: Path,
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # Detect schema type (check if element_geometry view exists)
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='view' AND name='element_geometry'")
+    has_element_geometry_view = cursor.fetchone() is not None
+
+    # Choose table/view based on schema
+    if has_element_geometry_view:
+        # Federation database schema (element_geometry view)
+        geometry_table = "element_geometry"
+        if verbose:
+            print("DEBUG: Using element_geometry view (Federation schema)")
+    else:
+        # 2D-to-3D database schema (base_geometries table with guid)
+        geometry_table = "base_geometries"
+        if verbose:
+            print("DEBUG: Using base_geometries table (2D-to-3D schema)")
+
     # Get total count
-    cursor.execute("SELECT COUNT(*) FROM base_geometries")
-    total_count = cursor.fetchone()[0]
+    try:
+        cursor.execute(f"SELECT COUNT(*) FROM {geometry_table}")
+        total_count = cursor.fetchone()[0]
+        if verbose:
+            print(f"DEBUG: Total geometries in {geometry_table}: {total_count}")
+    except sqlite3.Error as e:
+        return {
+            'total': 0,
+            'validated': 0,
+            'passed': 0,
+            'failed': 0,
+            'errors': [f'Database query failed: {e}']
+        }
 
     if total_count == 0:
         return {
@@ -541,17 +585,30 @@ def validate_database_geometries(db_path: Path,
         sample_size = min(sample_size, total_count)
 
     # Query geometries
-    if sample_size < total_count:
-        # Random sample
-        cursor.execute("""
-            SELECT guid, vertices, faces, normals
-            FROM base_geometries
-            ORDER BY RANDOM()
-            LIMIT ?
-        """, (sample_size,))
-    else:
-        # All geometries
-        cursor.execute("SELECT guid, vertices, faces, normals FROM base_geometries")
+    try:
+        if sample_size < total_count:
+            # Random sample
+            if verbose:
+                print(f"DEBUG: Sampling {sample_size} random geometries")
+            cursor.execute(f"""
+                SELECT guid, vertices, faces, normals
+                FROM {geometry_table}
+                ORDER BY RANDOM()
+                LIMIT ?
+            """, (sample_size,))
+        else:
+            # All geometries
+            if verbose:
+                print(f"DEBUG: Validating all {total_count} geometries")
+            cursor.execute(f"SELECT guid, vertices, faces, normals FROM {geometry_table}")
+    except sqlite3.Error as e:
+        return {
+            'total': total_count,
+            'validated': 0,
+            'passed': 0,
+            'failed': 0,
+            'errors': [f'Failed to query geometries: {e}']
+        }
 
     # Validate each geometry
     passed_count = 0
