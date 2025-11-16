@@ -12,6 +12,7 @@ Usage:
 
     bonsai-test --sample 100 database.db     # Test random 100 elements
     bonsai-test --verbose database.db        # Detailed output
+    bonsai-test --json database.db           # JSON output (for GUI/scripting)
 
 Author: Redhuan D. Oon <red1org@gmail.com>
 License: LGPL-3.0
@@ -19,6 +20,7 @@ License: LGPL-3.0
 
 import sys
 import time
+import json
 import argparse
 from pathlib import Path
 
@@ -62,6 +64,8 @@ Tiers:
                        help='Validate random sample of N elements (default: all)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Print detailed validation results')
+    parser.add_argument('--json', action='store_true',
+                       help='Output results in JSON format (for GUI/scripting)')
     parser.add_argument('--version', action='version', version='BonsaiTester 0.1.0')
 
     args = parser.parse_args()
@@ -99,7 +103,7 @@ Tiers:
         return 0
 
     elif mode == 'geometry':
-        print("\n[Tier 2: Geometry Validation]")
+        # Run validation
         results = validate_database_geometries(
             args.database,
             sample_size=args.sample,
@@ -107,6 +111,23 @@ Tiers:
         )
 
         elapsed = time.time() - start_time
+        results['elapsed_time'] = elapsed
+
+        # JSON output mode (for GUI/scripting)
+        if args.json:
+            output = {
+                'mode': 'geometry',
+                'database': str(args.database),
+                'database_size_mb': args.database.stat().st_size / (1024**2),
+                'sample_size': args.sample,
+                'results': results,
+                'success': results['failed'] == 0
+            }
+            print(json.dumps(output, indent=2))
+            return 0 if results['failed'] == 0 else 1
+
+        # Normal text output
+        print("\n[Tier 2: Geometry Validation]")
 
         print(f"\n{'=' * 70}")
         print("VALIDATION SUMMARY")

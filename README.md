@@ -12,12 +12,23 @@ Stop wasting 2-5 minutes launching Blender to check if your IFC geometry is corr
 
 ## 🚀 Quick Start
 
+### Option 1: GUI (Recommended for Beginners)
+
 ```bash
 # Clone the repository
 cd ~/Documents/bonsai
 git clone https://github.com/red1oon/BonsaiTester.git
 cd BonsaiTester
 
+# Launch GUI
+./bonsai-test-gui
+```
+
+**Then:** Click "Browse", select your database, and click "Run Tests"!
+
+### Option 2: Command Line (For Power Users)
+
+```bash
 # Run validation (no installation needed!)
 ./bonsai-test path/to/your/database.db
 ```
@@ -100,7 +111,28 @@ BonsaiTester validates geometry in **10-20 seconds** without Blender:
 
 ## 📖 Usage
 
-### Basic Usage
+### GUI Mode (User-Friendly) 🖱️
+
+**Best for:** Engineers with minimal coding experience, visual feedback
+
+```bash
+./bonsai-test-gui
+```
+
+**Features:**
+- 🎯 Point-and-click interface
+- 📁 File browser for database selection
+- ✅ Checkbox selection for tests
+- 🎨 Color-coded results
+- 📊 Visual progress indicators
+
+**See:** `docs/GUI_USAGE.md` for detailed guide
+
+---
+
+### CLI Mode (Power Users) ⚡
+
+**Best for:** Automation, CI/CD, scripting, remote servers
 
 ```bash
 # Validate all geometries (default mode)
@@ -111,9 +143,12 @@ BonsaiTester validates geometry in **10-20 seconds** without Blender:
 
 # Detailed output (show individual element results)
 ./bonsai-test --verbose database.db
+
+# JSON output (for scripting/GUI)
+./bonsai-test --json database.db
 ```
 
-### Test Modes
+### CLI Test Modes
 
 ```bash
 # Fast mode: Schema validation only (future)
@@ -125,6 +160,22 @@ BonsaiTester validates geometry in **10-20 seconds** without Blender:
 # Full mode: All tiers including Blender (future)
 ./bonsai-test --full database.db
 ```
+
+---
+
+## 🆚 GUI vs CLI: Which Should I Use?
+
+| Use Case | Recommendation |
+|----------|----------------|
+| **First-time user** | ✅ **GUI** - Visual, intuitive |
+| **Quick manual test** | ✅ **GUI** - Click and go |
+| **Batch testing** | ⚡ **CLI** - Scriptable |
+| **CI/CD pipeline** | ⚡ **CLI** - Automation |
+| **Remote server** | ⚡ **CLI** - SSH-friendly |
+| **Learning tool** | ✅ **GUI** - See options visually |
+| **Power user** | ⚡ **CLI** - Faster workflow |
+
+**Pro tip:** Use **both**! GUI for exploration, CLI for automation.
 
 ### Python API
 
