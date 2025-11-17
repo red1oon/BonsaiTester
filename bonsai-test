@@ -31,6 +31,7 @@ from bonsai_tester.validators.geometry_validator import validate_database_geomet
 from bonsai_tester.validators.schema_validator import validate_database_schema
 from bonsai_tester.logger import BonsaiLogger, HTMLReportGenerator
 from bonsai_tester.repair import repair_database
+from bonsai_tester.gui_logger import get_logger, close_logger
 
 
 def main():
@@ -75,8 +76,15 @@ Tiers:
 
     args = parser.parse_args()
 
+    # Initialize console logger (logs to consolelogs/ folder)
+    console_logger = get_logger()
+    console_logger.section("BONSAITESTER CLI STARTUP")
+    console_logger.info(f"Database: {args.database}")
+    console_logger.info(f"Python version: {sys.version.split()[0]}")
+
     # Check database exists
     if not args.database.exists():
+        console_logger.error(f"Database not found: {args.database}")
         if args.json:
             error_output = {
                 'error': 'Database not found',
@@ -86,6 +94,7 @@ Tiers:
             print(json.dumps(error_output, indent=2))
         else:
             print(f"❌ Database not found: {args.database}")
+        close_logger()
         return 1
 
     # Determine mode (default: geometry)
@@ -96,13 +105,24 @@ Tiers:
     else:
         mode = 'geometry'  # Default
 
+    # Log test configuration
+    size_mb = args.database.stat().st_size / (1024**2)
+    console_logger.log_database_selection(args.database, size_mb)
+    console_logger.info(f"Test mode: {mode.upper()}")
+    if args.sample:
+        console_logger.info(f"Sample size: {args.sample} elements")
+    if args.verbose:
+        console_logger.debug("Verbose mode enabled")
+    if args.json:
+        console_logger.debug("JSON output mode enabled")
+
     # Print header (skip if JSON mode)
     if not args.json:
         print("=" * 70)
         print("BONSAI TESTER v0.1.0")
         print("=" * 70)
         print(f"Database: {args.database}")
-        print(f"Size: {args.database.stat().st_size / (1024**2):.1f} MB")
+        print(f"Size: {size_mb:.1f} MB")
         print(f"Mode: {mode.upper()}")
         if args.sample:
             print(f"Sample: {args.sample} elements")
@@ -118,9 +138,17 @@ Tiers:
             logger = BonsaiLogger(args.database, mode='fast')
             logger.log_section("[Tier 1: Schema Validation]")
 
+        # Log validator start
+        console_logger.log_validator_start("Tier 1", "Schema Validation")
+
         # Run schema validation
         results = validate_database_schema(args.database, verbose=args.verbose)
         elapsed = time.time() - start_time
+
+        # Log validator end
+        console_logger.log_validator_end("Tier 1", "Schema Validation",
+                                        results['passed'], results['failed'])
+        console_logger.log_performance("Schema Validation", elapsed * 1000)
 
         # JSON output mode
         if args.json:
@@ -167,6 +195,9 @@ Tiers:
                 logger.close()
                 print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
 
+            console_logger.section("TEST RESULT: FAILED")
+            console_logger.info(f"Log file: {console_logger.get_log_file()}")
+            close_logger()
             return 1
         else:
             print("\n✅ ALL SCHEMA CHECKS PASSED")
@@ -176,6 +207,9 @@ Tiers:
                 logger.close()
                 print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
 
+            console_logger.section("TEST RESULT: PASSED")
+            console_logger.info(f"Console log: {console_logger.get_log_file()}")
+            close_logger()
             return 0
 
     elif mode == 'geometry':
@@ -184,6 +218,9 @@ Tiers:
         if not args.json:
             logger = BonsaiLogger(args.database, mode='geometry')
             logger.log_section("[Tier 2: Geometry Validation]")
+
+        # Log validator start
+        console_logger.log_validator_start("Tier 2", "Geometry Validation")
 
         # Run validation
         results = validate_database_geometries(
@@ -194,6 +231,11 @@ Tiers:
 
         elapsed = time.time() - start_time
         results['elapsed_time'] = elapsed
+
+        # Log validator end
+        console_logger.log_validator_end("Tier 2", "Geometry Validation",
+                                        results['passed'], results['failed'])
+        console_logger.log_performance("Geometry Validation", elapsed * 1000)
 
         # JSON output mode (for GUI/scripting)
         if args.json:
@@ -265,6 +307,10 @@ Tiers:
                 logger.close()
                 print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
 
+            console_logger.section("TEST RESULT: FAILED")
+            console_logger.info(f"Failed geometries: {results['failed']:,}")
+            console_logger.info(f"Console log: {console_logger.get_log_file()}")
+            close_logger()
             return 1
         else:
             print("\n✅ ALL GEOMETRIES VALID")
@@ -274,6 +320,10 @@ Tiers:
                 logger.close()
                 print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
 
+            console_logger.section("TEST RESULT: PASSED")
+            console_logger.info(f"Validated geometries: {results['validated']:,}")
+            console_logger.info(f"Console log: {console_logger.get_log_file()}")
+            close_logger()
             return 0
 
     elif mode == 'full':
