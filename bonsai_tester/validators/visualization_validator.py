@@ -474,10 +474,15 @@ def validate_material_assignments(db_path: Path, verbose: bool = False) -> Dict:
     """
     Validate that elements have material assignments with colors (RGBA).
 
+    CRITICAL: Bonsai Material mode reads from elements_meta.material_rgba,
+    NOT from material_assignments table!
+
     For Material mode in Blender to display colors, elements need:
-    1. Material assigned in material_assignments table
-    2. RGBA color values defined
-    3. Materials linked to element GUIDs
+    1. elements_meta.material_name populated
+    2. elements_meta.material_rgba populated
+    3. RGBA format: "R,G,B,A" (e.g., "1.0,0.2,0.2,1.0")
+
+    The material_assignments table is checked as secondary source.
 
     Returns:
         Dictionary with material assignment validation results
@@ -486,87 +491,92 @@ def validate_material_assignments(db_path: Path, verbose: bool = False) -> Dict:
     cursor = conn.cursor()
 
     try:
-        # Check if material_assignments table exists
-        cursor.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='material_assignments'
-        """)
+        # CRITICAL: Check elements_meta columns first (Bonsai reads from here!)
+        cursor.execute("PRAGMA table_info(elements_meta)")
+        columns = [row[1] for row in cursor.fetchall()]
 
-        if not cursor.fetchone():
-            return {
-                'status': 'SKIP',
-                'message': 'No material_assignments table found',
-                'total_elements': 0,
-                'elements_with_materials': 0,
-                'materials': {}
-            }
+        has_meta_columns = 'material_name' in columns and 'material_rgba' in columns
 
         # Get total elements
         cursor.execute("SELECT COUNT(*) FROM elements_meta")
         total_elements = cursor.fetchone()[0]
 
-        # Get material assignment counts
-        cursor.execute("""
-            SELECT COUNT(DISTINCT guid)
-            FROM material_assignments
-        """)
-        elements_with_materials = cursor.fetchone()[0]
+        # Check elements_meta material columns (PRIMARY SOURCE for Material mode)
+        elements_with_meta_materials = 0
+        if has_meta_columns:
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM elements_meta
+                WHERE material_rgba IS NOT NULL AND material_rgba != ''
+            """)
+            elements_with_meta_materials = cursor.fetchone()[0]
 
-        # Get material distribution
+        # Check material_assignments table (SECONDARY SOURCE)
         cursor.execute("""
-            SELECT
-                material_name,
-                rgba,
-                COUNT(*) as count
-            FROM material_assignments
-            GROUP BY material_name
-            ORDER BY count DESC
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='material_assignments'
         """)
-        material_data = cursor.fetchall()
+
+        has_assignments_table = cursor.fetchone() is not None
+        elements_with_assignments = 0
+
+        if has_assignments_table:
+            cursor.execute("""
+                SELECT COUNT(DISTINCT guid)
+                FROM material_assignments
+            """)
+            elements_with_assignments = cursor.fetchone()[0]
+
+        # Get material distribution from material_assignments (if exists)
+        materials = {}
+        if has_assignments_table:
+            cursor.execute("""
+                SELECT
+                    material_name,
+                    rgba,
+                    COUNT(*) as count
+                FROM material_assignments
+                GROUP BY material_name
+                ORDER BY count DESC
+            """)
+            material_data = cursor.fetchall()
+
+            for mat_name, rgba, count in material_data:
+                has_color = rgba is not None and rgba != ''
+                materials[mat_name] = {
+                    'count': count,
+                    'rgba': rgba,
+                    'has_color': has_color,
+                    'source': 'material_assignments'
+                }
 
         conn.close()
 
-        # Analyze materials
-        materials = {}
-        materials_with_color = 0
-        materials_without_color = 0
+        # Determine status (CRITICAL: elements_meta.material_rgba is what Bonsai uses!)
+        meta_coverage = elements_with_meta_materials / total_elements if total_elements > 0 else 0
 
-        for mat_name, rgba, count in material_data:
-            has_color = rgba is not None and rgba != ''
-            materials[mat_name] = {
-                'count': count,
-                'rgba': rgba,
-                'has_color': has_color
-            }
-            if has_color:
-                materials_with_color += count
-            else:
-                materials_without_color += count
-
-        # Determine status
-        coverage_ratio = elements_with_materials / total_elements if total_elements > 0 else 0
-
-        if coverage_ratio == 0:
+        if not has_meta_columns:
+            status = "WARNING"
+            message = "elements_meta missing material_name/material_rgba columns"
+        elif meta_coverage == 0:
             status = "CRITICAL"
-            message = "No elements have material assignments"
-        elif coverage_ratio < 0.5:
+            message = "Material mode will NOT work: elements_meta.material_rgba is empty (all NULL)"
+        elif meta_coverage < 0.5:
             status = "WARNING"
-            message = f"Only {coverage_ratio*100:.1f}% of elements have materials"
-        elif materials_without_color > 0:
-            status = "WARNING"
-            message = f"{materials_without_color} elements have materials without colors"
+            message = f"Only {meta_coverage*100:.1f}% of elements have material_rgba in elements_meta"
         else:
             status = "OK"
-            message = f"All {elements_with_materials} elements have materials with colors"
+            message = f"Material mode ready: {elements_with_meta_materials}/{total_elements} elements have material_rgba"
 
         return {
             'status': status,
             'message': message,
             'total_elements': total_elements,
-            'elements_with_materials': elements_with_materials,
-            'materials_with_color': materials_with_color,
-            'materials_without_color': materials_without_color,
-            'coverage_ratio': coverage_ratio,
+            'elements_meta_coverage': elements_with_meta_materials,
+            'elements_meta_ratio': meta_coverage,
+            'elements_with_assignments': elements_with_assignments,
+            'has_meta_columns': has_meta_columns,
+            'has_assignments_table': has_assignments_table,
             'unique_materials': len(materials),
             'materials': materials
         }
@@ -1218,16 +1228,20 @@ def generate_visualization_report(report: VisualizationReport) -> str:
 
     # Material assignments
     lines.append("")
-    lines.append("MATERIAL ASSIGNMENT VALIDATION")
+    lines.append("MATERIAL ASSIGNMENT VALIDATION (Material Mode Readiness)")
     lines.append("-" * 70)
     mats = report.material_assignments
     lines.append(f"  Status: {mats.get('status', 'UNKNOWN')}")
     lines.append(f"  Message: {mats.get('message', 'N/A')}")
-    lines.append(f"  Coverage: {mats.get('elements_with_materials', 0)}/{mats.get('total_elements', 0)} ({mats.get('coverage_ratio', 0)*100:.1f}%)")
+    lines.append("")
+    lines.append(f"  CRITICAL: Bonsai Material mode reads from elements_meta.material_rgba!")
+    lines.append(f"  elements_meta.material_rgba: {mats.get('elements_meta_coverage', 0)}/{mats.get('total_elements', 0)} ({mats.get('elements_meta_ratio', 0)*100:.1f}%)")
+    lines.append(f"  material_assignments table: {mats.get('elements_with_assignments', 0)}/{mats.get('total_elements', 0)}")
 
     if mats.get('unique_materials', 0) > 0:
-        lines.append(f"  Unique Materials: {mats['unique_materials']}")
-        lines.append("\n  Material Distribution:")
+        lines.append(f"\n  Materials in material_assignments table: {mats['unique_materials']}")
+        lines.append("  (Note: This table is NOT used by Material mode)")
+        lines.append("\n  Material Distribution (from material_assignments):")
         for mat_name, mat_info in list(mats.get('materials', {}).items())[:10]:
             color_marker = "✓" if mat_info['has_color'] else "✗"
             rgba_display = mat_info['rgba'] if mat_info['rgba'] else "NO COLOR"
