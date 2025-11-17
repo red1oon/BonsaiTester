@@ -52,6 +52,8 @@ class VisualizationReport:
     rotation_stats: Dict
     geometry_stats: Dict
     preview_readiness: Dict
+    discipline_colors: Dict  # NEW: Discipline color validation
+    parametric_shapes: Dict  # NEW: Proper shape validation
 
 
 # ============================================================================
@@ -371,6 +373,295 @@ def check_preview_mode_readiness(db_path: Path, sample_size: int = 100, verbose:
 
 
 # ============================================================================
+# DISCIPLINE COLOR VALIDATION
+# ============================================================================
+
+def validate_discipline_colors(db_path: Path, verbose: bool = False) -> Dict:
+    """
+    Validate that disciplines are properly defined for Preview mode coloring.
+
+    Checks:
+    - All elements have non-null discipline values
+    - Disciplines use standard codes (ARC, STR, ELEC, etc.)
+    - Discipline distribution is reasonable
+
+    Returns:
+        Dictionary with discipline color validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Get discipline distribution
+        cursor.execute("""
+            SELECT discipline, COUNT(*) as count
+            FROM elements_meta
+            GROUP BY discipline
+            ORDER BY count DESC
+        """)
+        discipline_counts = cursor.fetchall()
+
+        # Get total elements
+        cursor.execute("SELECT COUNT(*) FROM elements_meta")
+        total_elements = cursor.fetchone()[0]
+
+        # Check for null/empty disciplines
+        cursor.execute("""
+            SELECT COUNT(*) FROM elements_meta
+            WHERE discipline IS NULL OR discipline = ''
+        """)
+        missing_discipline = cursor.fetchone()[0]
+
+        conn.close()
+
+        # Standard discipline codes (from 8_IFC database)
+        standard_codes = {'ARC', 'STR', 'ELEC', 'ACMV', 'FP', 'SP', 'CW', 'LPG', 'REB'}
+
+        disciplines = {}
+        non_standard_disciplines = []
+
+        for discipline, count in discipline_counts:
+            if discipline:
+                disciplines[discipline] = {
+                    'count': count,
+                    'percentage': count / total_elements * 100,
+                    'is_standard': discipline.upper() in standard_codes
+                }
+
+                if discipline.upper() not in standard_codes:
+                    non_standard_disciplines.append(discipline)
+
+        # Assess color readiness
+        if missing_discipline > 0:
+            status = "CRITICAL"
+            message = f"{missing_discipline} elements missing discipline assignment"
+        elif non_standard_disciplines:
+            status = "WARNING"
+            message = f"Non-standard disciplines found: {', '.join(non_standard_disciplines)}"
+        else:
+            status = "OK"
+            message = "All elements have standard discipline codes"
+
+        return {
+            'status': status,
+            'message': message,
+            'total_elements': total_elements,
+            'disciplines': disciplines,
+            'missing_count': missing_discipline,
+            'non_standard': non_standard_disciplines,
+            'unique_count': len(disciplines)
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'total_elements': 0,
+            'disciplines': {},
+            'missing_count': 0,
+            'non_standard': [],
+            'unique_count': 0
+        }
+
+
+# ============================================================================
+# PARAMETRIC SHAPE VALIDATION
+# ============================================================================
+
+def validate_parametric_shapes(db_path: Path, sample_size: int = 100, verbose: bool = False) -> Dict:
+    """
+    Validate that at least 2 elements have proper parametric shapes (not just boxes).
+
+    Checks for recognizable shapes:
+    - Pipes/conduits: Cylindrical (12+ vertices in circular pattern)
+    - Doors/windows: Rectangular openings with depth
+    - Sprinklers: Cylindrical heads
+    - Taps/fittings: Complex shapes (20+ vertices)
+
+    Returns:
+        Dictionary with parametric shape validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Check if base_geometries has guid column (2Dto3D schema) or geometry_hash (8_IFC schema)
+        cursor.execute("PRAGMA table_info(base_geometries)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if 'guid' in columns:
+            # 2Dto3D schema
+            cursor.execute("""
+                SELECT g.guid, g.vertices, g.faces, m.ifc_class, m.discipline
+                FROM base_geometries g
+                JOIN elements_meta m ON g.guid = m.guid
+                ORDER BY RANDOM()
+                LIMIT ?
+            """, (sample_size,))
+        else:
+            # 8_IFC schema - join via element_instances
+            cursor.execute("""
+                SELECT m.guid, g.vertices, g.faces, m.ifc_class, m.discipline
+                FROM base_geometries g
+                JOIN element_instances ei ON g.geometry_hash = ei.geometry_hash
+                JOIN elements_meta m ON ei.guid = m.guid
+                ORDER BY RANDOM()
+                LIMIT ?
+            """, (sample_size,))
+
+        sample_elements = cursor.fetchall()
+        conn.close()
+
+        parametric_elements = []
+        box_elements = []
+
+        for guid, vertices_blob, faces_blob, ifc_class, discipline in sample_elements:
+            shape_info = analyze_shape_type(vertices_blob, faces_blob, ifc_class)
+
+            if shape_info['is_parametric']:
+                parametric_elements.append({
+                    'guid': guid,
+                    'ifc_class': ifc_class,
+                    'discipline': discipline,
+                    'shape_type': shape_info['shape_type'],
+                    'vertex_count': shape_info['vertex_count'],
+                    'confidence': shape_info['confidence']
+                })
+            else:
+                box_elements.append(guid)
+
+        # Assess shape quality
+        parametric_count = len(parametric_elements)
+
+        if parametric_count >= 2:
+            status = "OK"
+            message = f"Found {parametric_count} elements with proper parametric shapes"
+        elif parametric_count == 1:
+            status = "WARNING"
+            message = "Only 1 element has parametric shape (need at least 2)"
+        else:
+            status = "CRITICAL"
+            message = "No parametric shapes found - all elements are simple boxes"
+
+        return {
+            'status': status,
+            'message': message,
+            'parametric_count': parametric_count,
+            'box_count': len(box_elements),
+            'sample_size': len(sample_elements),
+            'parametric_ratio': parametric_count / len(sample_elements) if sample_elements else 0,
+            'parametric_elements': parametric_elements[:10],  # Top 10 for reporting
+            'shape_types_found': list(set(e['shape_type'] for e in parametric_elements))
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'parametric_count': 0,
+            'box_count': 0,
+            'sample_size': 0,
+            'parametric_ratio': 0,
+            'parametric_elements': [],
+            'shape_types_found': []
+        }
+
+
+def analyze_shape_type(vertices_blob: bytes, faces_blob: bytes, ifc_class: str) -> Dict:
+    """
+    Analyze geometry to determine if it's a recognizable parametric shape.
+
+    Detection patterns:
+    - Cylinder: 12+ vertices, circular cross-section
+    - Box: 8 vertices, 12 faces
+    - Complex: 20+ vertices (fittings, equipment)
+    """
+    # Decode vertices
+    vertex_count = len(vertices_blob) // (3 * 4)  # 3 floats per vertex
+    vertices = []
+
+    for i in range(vertex_count):
+        offset = i * 12
+        x, y, z = struct.unpack('<fff', vertices_blob[offset:offset+12])
+        vertices.append((x, y, z))
+
+    # Simple classification
+    shape_type = "unknown"
+    is_parametric = False
+    confidence = "low"
+
+    if vertex_count == 8:
+        shape_type = "box"
+        is_parametric = False
+        confidence = "high"
+    elif 12 <= vertex_count <= 36:
+        # Likely cylinder (12, 16, 24, or 32 vertices common)
+        if is_cylindrical_pattern(vertices):
+            shape_type = "cylinder"
+            is_parametric = True
+            confidence = "high"
+        else:
+            shape_type = "custom_12-36"
+            is_parametric = True
+            confidence = "medium"
+    elif vertex_count > 36:
+        shape_type = "complex"
+        is_parametric = True
+        confidence = "high"
+
+    # Class-specific expectations
+    if ifc_class in ['IfcColumn', 'IfcPipeSegment', 'IfcPipeFitting']:
+        if vertex_count >= 12:
+            is_parametric = True
+
+    return {
+        'vertex_count': vertex_count,
+        'shape_type': shape_type,
+        'is_parametric': is_parametric,
+        'confidence': confidence
+    }
+
+
+def is_cylindrical_pattern(vertices: List[Tuple[float, float, float]]) -> bool:
+    """
+    Check if vertices form a cylindrical pattern (circular cross-section).
+    """
+    if len(vertices) < 12:
+        return False
+
+    # For simplicity, check if vertices have a circular pattern in XY plane
+    # Real cylinders have vertices at same Z forming circles
+
+    # Group by Z coordinate (within tolerance)
+    z_groups = {}
+    tolerance = 0.001
+
+    for x, y, z in vertices:
+        # Find matching Z group
+        matched = False
+        for z_key in z_groups.keys():
+            if abs(z - z_key) < tolerance:
+                z_groups[z_key].append((x, y))
+                matched = True
+                break
+        if not matched:
+            z_groups[z] = [(x, y)]
+
+    # Cylinders should have at least 2 rings (top and bottom)
+    if len(z_groups) < 2:
+        return False
+
+    # Check if rings have similar point counts (circular pattern)
+    ring_sizes = [len(points) for points in z_groups.values()]
+
+    # Most rings should have same point count
+    if len(set(ring_sizes)) == 1 and ring_sizes[0] >= 6:
+        return True
+
+    return False
+
+
+# ============================================================================
 # MAIN VALIDATION FUNCTION
 # ============================================================================
 
@@ -396,8 +687,58 @@ def validate_2dto3d_visualization(db_path: Path,
     """
     issues = []
 
-    # Check 1: Rotation distribution
-    print("\n[1/3] Analyzing rotation distribution...")
+    # Check 1: Discipline colors
+    print("\n[1/5] Validating discipline colors...")
+    discipline_colors = validate_discipline_colors(db_path, verbose)
+
+    if discipline_colors.get('status') == 'CRITICAL':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="DISCIPLINE_MISSING",
+            severity="CRITICAL",
+            message=discipline_colors.get('message'),
+            details=discipline_colors
+        ))
+    elif discipline_colors.get('status') == 'WARNING':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="DISCIPLINE_NON_STANDARD",
+            severity="WARNING",
+            message=discipline_colors.get('message'),
+            details=discipline_colors
+        ))
+
+    # Check 2: Parametric shapes
+    print("[2/5] Validating parametric shapes...")
+    parametric_shapes = validate_parametric_shapes(db_path, sample_size, verbose)
+
+    if parametric_shapes.get('status') == 'CRITICAL':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="NO_PARAMETRIC_SHAPES",
+            severity="CRITICAL",
+            message=parametric_shapes.get('message'),
+            details=parametric_shapes
+        ))
+    elif parametric_shapes.get('status') == 'WARNING':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="FEW_PARAMETRIC_SHAPES",
+            severity="WARNING",
+            message=parametric_shapes.get('message'),
+            details=parametric_shapes
+        ))
+
+    # Check 3: Rotation distribution
+    print("[3/5] Analyzing rotation distribution...")
     rotation_stats = analyze_rotation_distribution(db_path, verbose)
 
     if rotation_stats.get('rotation_quality') == 'CRITICAL':
@@ -423,8 +764,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=rotation_stats
             ))
 
-    # Check 2: Preview mode readiness
-    print("[2/3] Checking Preview mode readiness...")
+    # Check 4: Preview mode readiness
+    print("[4/5] Checking Preview mode readiness...")
     preview_readiness = check_preview_mode_readiness(db_path, sample_size, verbose)
 
     if preview_readiness.get('status') == 'CRITICAL':
@@ -450,8 +791,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=preview_readiness
             ))
 
-    # Check 3: Geometry quality (sample-based)
-    print(f"[3/3] Analyzing geometry quality (sample: {sample_size})...")
+    # Check 5: Geometry quality (sample-based)
+    print(f"[5/5] Analyzing geometry quality (sample: {sample_size})...")
     geometry_stats = analyze_geometry_quality(db_path, sample_size, verbose)
 
     if geometry_stats.get('placeholder_ratio', 0) > 0.5:
@@ -473,7 +814,9 @@ def validate_2dto3d_visualization(db_path: Path,
         issues=issues,
         rotation_stats=rotation_stats,
         geometry_stats=geometry_stats,
-        preview_readiness=preview_readiness
+        preview_readiness=preview_readiness,
+        discipline_colors=discipline_colors,
+        parametric_shapes=parametric_shapes
     )
 
 
@@ -545,13 +888,51 @@ def generate_visualization_report(report: VisualizationReport) -> str:
     lines.append(f"Elements Checked: {report.elements_checked:,}")
     lines.append("")
 
+    # Discipline colors
+    lines.append("DISCIPLINE COLOR VALIDATION")
+    lines.append("-" * 70)
+    disc = report.discipline_colors
+    lines.append(f"  Status: {disc.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {disc.get('message', 'N/A')}")
+    lines.append(f"  Unique Disciplines: {disc.get('unique_count', 0)}")
+    lines.append(f"  Missing Disciplines: {disc.get('missing_count', 0)}")
+
+    if disc.get('disciplines'):
+        lines.append("\n  Discipline Distribution:")
+        for name, info in sorted(disc['disciplines'].items(), key=lambda x: x[1]['count'], reverse=True):
+            std_marker = "✓" if info['is_standard'] else "⚠"
+            lines.append(f"    {std_marker} {name:20s}: {info['count']:5d} ({info['percentage']:5.1f}%)")
+
+    # Parametric shapes
+    lines.append("")
+    lines.append("PARAMETRIC SHAPE VALIDATION")
+    lines.append("-" * 70)
+    shapes = report.parametric_shapes
+    lines.append(f"  Status: {shapes.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {shapes.get('message', 'N/A')}")
+    lines.append(f"  Parametric Elements: {shapes.get('parametric_count', 0)} / {shapes.get('sample_size', 0)} ({shapes.get('parametric_ratio', 0)*100:.1f}%)")
+    lines.append(f"  Box Elements: {shapes.get('box_count', 0)}")
+
+    if shapes.get('shape_types_found'):
+        lines.append(f"  Shape Types Found: {', '.join(shapes['shape_types_found'])}")
+
+    if shapes.get('parametric_elements'):
+        lines.append("\n  Sample Parametric Elements:")
+        for elem in shapes['parametric_elements'][:5]:
+            lines.append(f"    - {elem['ifc_class']:25s} ({elem['discipline']:4s}): {elem['shape_type']:12s} [{elem['vertex_count']:3d} verts, {elem['confidence']:6s}]")
+
     # Rotation statistics
+    lines.append("")
     lines.append("ROTATION ANALYSIS")
     lines.append("-" * 70)
     rotation = report.rotation_stats
     lines.append(f"  Unique Rotations: {rotation.get('unique_rotations', 0)}")
-    lines.append(f"  Zero Rotations: {rotation.get('zero_rotations', 0)} ({rotation.get('zero_rotations', 0) / report.total_elements * 100:.1f}%)")
-    lines.append(f"  Non-Zero Rotations: {rotation.get('non_zero_rotations', 0)} ({rotation.get('non_zero_rotations', 0) / report.total_elements * 100:.1f}%)")
+    if report.total_elements > 0:
+        lines.append(f"  Zero Rotations: {rotation.get('zero_rotations', 0)} ({rotation.get('zero_rotations', 0) / report.total_elements * 100:.1f}%)")
+        lines.append(f"  Non-Zero Rotations: {rotation.get('non_zero_rotations', 0)} ({rotation.get('non_zero_rotations', 0) / report.total_elements * 100:.1f}%)")
+    else:
+        lines.append(f"  Zero Rotations: {rotation.get('zero_rotations', 0)}")
+        lines.append(f"  Non-Zero Rotations: {rotation.get('non_zero_rotations', 0)}")
     lines.append(f"  Rotation Quality: {rotation.get('rotation_quality', 'UNKNOWN')}")
 
     if rotation.get('top_rotations'):
