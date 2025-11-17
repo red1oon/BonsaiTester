@@ -388,6 +388,7 @@ def validate_geometry_blob(guid: str,
                            faces_blob: bytes,
                            normals_blob: Optional[bytes],
                            expected_bbox: Optional[Tuple[float, float, float]] = None,
+                           ifc_class: Optional[str] = None,
                            verbose: bool = False) -> List[ValidationResult]:
     """
     Comprehensive validation of a single geometry blob.
@@ -398,6 +399,7 @@ def validate_geometry_blob(guid: str,
         faces_blob: Binary face data
         normals_blob: Binary normal data
         expected_bbox: Optional (width, depth, height) for dimension validation
+        ifc_class: Optional IFC class name for class-specific validation
         verbose: If True, include detailed validation results
 
     Returns:
@@ -486,33 +488,60 @@ def validate_geometry_blob(guid: str,
                 message=f"Bbox size valid: {bbox_size[0]:.2f}×{bbox_size[1]:.2f}×{bbox_size[2]:.2f}m"
             ))
 
-        # Validation 6b: Preview cube anomaly check (non-critical warning)
-        # Check if bbox is suspiciously cube-like (all dimensions equal)
-        # This can indicate incorrect preview geometry generation
-        if min_dim > 0.001:  # Only check if bbox is valid
+        # Validation 6b: Class-based cube anomaly check
+        # Certain IFC classes should NEVER be cube-like (linear/planar elements)
+        # Others (equipment, furniture) legitimately can be cubes
+        if min_dim > 0.001 and ifc_class:  # Only check if bbox is valid and we have class info
             w, d, h = bbox_size
-            # Calculate aspect ratios
-            tolerance = 0.05  # 5% tolerance for "equal" dimensions
-            avg_dim = (w + d + h) / 3
 
-            # Check if all dimensions are within 5% of each other (cube-like)
-            w_diff = abs(w - avg_dim) / avg_dim if avg_dim > 0 else 0
-            d_diff = abs(d - avg_dim) / avg_dim if avg_dim > 0 else 0
-            h_diff = abs(h - avg_dim) / avg_dim if avg_dim > 0 else 0
+            # Define IFC classes that should NOT be cube-like
+            LINEAR_CLASSES = {
+                'IfcWall', 'IfcWallStandardCase', 'IfcCurtainWall',
+                'IfcBeam', 'IfcColumn',
+                'IfcPipeSegment', 'IfcCableSegment', 'IfcDuctSegment',
+                'IfcCableCarrierSegment', 'IfcConduit',
+                'IfcRailing', 'IfcRamp', 'IfcStair', 'IfcStairFlight',
+                'IfcMember', 'IfcPlate', 'IfcSlab', 'IfcRoof'
+            }
 
-            is_cube_like = (w_diff < tolerance and d_diff < tolerance and h_diff < tolerance)
+            # Classes that CAN legitimately be cubes (skip check)
+            ALLOWED_CUBE_CLASSES = {
+                'IfcBuildingElementProxy',  # Can be equipment/furniture
+                'IfcFurnishingElement', 'IfcFurniture',
+                'IfcFlowTerminal',  # Equipment
+                'IfcDistributionControlElement'
+            }
 
-            if is_cube_like and max_dim > 0.01:  # Only flag cubes larger than 1cm
-                results.append(ValidationResult(
-                    passed=False,
-                    message=f"Preview cube anomaly: bbox is suspiciously cube-like ({w:.3f}×{d:.3f}×{h:.3f}m, ratio ~1:1:1)"
-                ))
-            elif verbose:
-                # Pass - bbox has reasonable aspect ratio
-                ratio_str = f"{w/min_dim:.1f}:{d/min_dim:.1f}:{h/min_dim:.1f}"
+            # Only validate if element is in LINEAR_CLASSES
+            if ifc_class in LINEAR_CLASSES:
+                # Calculate aspect ratios
+                tolerance = 0.05  # 5% tolerance for "equal" dimensions
+                avg_dim = (w + d + h) / 3
+
+                # Check if all dimensions are within 5% of each other (cube-like)
+                w_diff = abs(w - avg_dim) / avg_dim if avg_dim > 0 else 0
+                d_diff = abs(d - avg_dim) / avg_dim if avg_dim > 0 else 0
+                h_diff = abs(h - avg_dim) / avg_dim if avg_dim > 0 else 0
+
+                is_cube_like = (w_diff < tolerance and d_diff < tolerance and h_diff < tolerance)
+
+                if is_cube_like and max_dim > 0.01:  # Only flag cubes larger than 1cm
+                    results.append(ValidationResult(
+                        passed=False,
+                        message=f"Cube anomaly in {ifc_class}: should be linear but bbox is cube-like ({w:.3f}×{d:.3f}×{h:.3f}m)"
+                    ))
+                elif verbose:
+                    # Pass - linear element has proper elongated geometry
+                    ratio_str = f"{w/min_dim:.1f}:{d/min_dim:.1f}:{h/min_dim:.1f}"
+                    results.append(ValidationResult(
+                        passed=True,
+                        message=f"{ifc_class} aspect ratio OK: {ratio_str}"
+                    ))
+            elif verbose and ifc_class in ALLOWED_CUBE_CLASSES:
+                # Cube-like is acceptable for these classes
                 results.append(ValidationResult(
                     passed=True,
-                    message=f"Bbox aspect ratio OK: {ratio_str}"
+                    message=f"{ifc_class} can be cube-like (equipment/furniture)"
                 ))
 
         # Validation 7: Expected dimensions (if provided)
@@ -613,15 +642,16 @@ def validate_database_geometries(db_path: Path,
     else:
         sample_size = min(sample_size, total_count)
 
-    # Query geometries
+    # Query geometries with IFC class (join with elements_meta)
     try:
         if sample_size < total_count:
             # Random sample
             if verbose:
                 print(f"DEBUG: Sampling {sample_size} random geometries")
             cursor.execute(f"""
-                SELECT guid, vertices, faces, normals
-                FROM {geometry_table}
+                SELECT g.guid, g.vertices, g.faces, g.normals, m.ifc_class
+                FROM {geometry_table} g
+                LEFT JOIN elements_meta m ON g.guid = m.guid
                 ORDER BY RANDOM()
                 LIMIT ?
             """, (sample_size,))
@@ -629,7 +659,11 @@ def validate_database_geometries(db_path: Path,
             # All geometries
             if verbose:
                 print(f"DEBUG: Validating all {total_count} geometries")
-            cursor.execute(f"SELECT guid, vertices, faces, normals FROM {geometry_table}")
+            cursor.execute(f"""
+                SELECT g.guid, g.vertices, g.faces, g.normals, m.ifc_class
+                FROM {geometry_table} g
+                LEFT JOIN elements_meta m ON g.guid = m.guid
+            """)
     except sqlite3.Error as e:
         return {
             'total': total_count,
@@ -645,10 +679,13 @@ def validate_database_geometries(db_path: Path,
     validation_failures = []
 
     for row in cursor.fetchall():
-        guid, vertices_blob, faces_blob, normals_blob = row
+        guid, vertices_blob, faces_blob, normals_blob, ifc_class = row
 
         try:
-            results = validate_geometry_blob(guid, vertices_blob, faces_blob, normals_blob, verbose=verbose)
+            results = validate_geometry_blob(
+                guid, vertices_blob, faces_blob, normals_blob,
+                ifc_class=ifc_class, verbose=verbose
+            )
 
             # Check if all validations passed
             all_passed = all(r.passed for r in results)
