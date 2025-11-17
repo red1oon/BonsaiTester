@@ -55,6 +55,7 @@ class VisualizationReport:
     discipline_colors: Dict  # NEW: Discipline color validation
     parametric_shapes: Dict  # NEW: Proper shape validation
     dimension_variance: Dict  # NEW: Dimension variance validation
+    material_assignments: Dict  # NEW: Material assignment validation
 
 
 # ============================================================================
@@ -466,6 +467,121 @@ def validate_discipline_colors(db_path: Path, verbose: bool = False) -> Dict:
 
 
 # ============================================================================
+# MATERIAL ASSIGNMENT VALIDATION
+# ============================================================================
+
+def validate_material_assignments(db_path: Path, verbose: bool = False) -> Dict:
+    """
+    Validate that elements have material assignments with colors (RGBA).
+
+    For Material mode in Blender to display colors, elements need:
+    1. Material assigned in material_assignments table
+    2. RGBA color values defined
+    3. Materials linked to element GUIDs
+
+    Returns:
+        Dictionary with material assignment validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Check if material_assignments table exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='material_assignments'
+        """)
+
+        if not cursor.fetchone():
+            return {
+                'status': 'SKIP',
+                'message': 'No material_assignments table found',
+                'total_elements': 0,
+                'elements_with_materials': 0,
+                'materials': {}
+            }
+
+        # Get total elements
+        cursor.execute("SELECT COUNT(*) FROM elements_meta")
+        total_elements = cursor.fetchone()[0]
+
+        # Get material assignment counts
+        cursor.execute("""
+            SELECT COUNT(DISTINCT guid)
+            FROM material_assignments
+        """)
+        elements_with_materials = cursor.fetchone()[0]
+
+        # Get material distribution
+        cursor.execute("""
+            SELECT
+                material_name,
+                rgba,
+                COUNT(*) as count
+            FROM material_assignments
+            GROUP BY material_name
+            ORDER BY count DESC
+        """)
+        material_data = cursor.fetchall()
+
+        conn.close()
+
+        # Analyze materials
+        materials = {}
+        materials_with_color = 0
+        materials_without_color = 0
+
+        for mat_name, rgba, count in material_data:
+            has_color = rgba is not None and rgba != ''
+            materials[mat_name] = {
+                'count': count,
+                'rgba': rgba,
+                'has_color': has_color
+            }
+            if has_color:
+                materials_with_color += count
+            else:
+                materials_without_color += count
+
+        # Determine status
+        coverage_ratio = elements_with_materials / total_elements if total_elements > 0 else 0
+
+        if coverage_ratio == 0:
+            status = "CRITICAL"
+            message = "No elements have material assignments"
+        elif coverage_ratio < 0.5:
+            status = "WARNING"
+            message = f"Only {coverage_ratio*100:.1f}% of elements have materials"
+        elif materials_without_color > 0:
+            status = "WARNING"
+            message = f"{materials_without_color} elements have materials without colors"
+        else:
+            status = "OK"
+            message = f"All {elements_with_materials} elements have materials with colors"
+
+        return {
+            'status': status,
+            'message': message,
+            'total_elements': total_elements,
+            'elements_with_materials': elements_with_materials,
+            'materials_with_color': materials_with_color,
+            'materials_without_color': materials_without_color,
+            'coverage_ratio': coverage_ratio,
+            'unique_materials': len(materials),
+            'materials': materials
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'total_elements': 0,
+            'elements_with_materials': 0,
+            'materials': {}
+        }
+
+
+# ============================================================================
 # DIMENSION VARIANCE VALIDATION
 # ============================================================================
 
@@ -831,7 +947,7 @@ def validate_2dto3d_visualization(db_path: Path,
     issues = []
 
     # Check 1: Discipline colors
-    print("\n[1/5] Validating discipline colors...")
+    print("\n[1/7] Validating discipline colors...")
     discipline_colors = validate_discipline_colors(db_path, verbose)
 
     if discipline_colors.get('status') == 'CRITICAL':
@@ -855,8 +971,33 @@ def validate_2dto3d_visualization(db_path: Path,
             details=discipline_colors
         ))
 
-    # Check 2: Dimension variance (properly sized boxes)
-    print("[2/6] Validating dimension variance...")
+    # Check 2: Material assignments
+    print("[2/7] Validating material assignments...")
+    material_assignments = validate_material_assignments(db_path, verbose)
+
+    if material_assignments.get('status') == 'CRITICAL':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="NO_MATERIALS",
+            severity="CRITICAL",
+            message=material_assignments.get('message'),
+            details=material_assignments
+        ))
+    elif material_assignments.get('status') == 'WARNING':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="INCOMPLETE_MATERIALS",
+            severity="WARNING",
+            message=material_assignments.get('message'),
+            details=material_assignments
+        ))
+
+    # Check 3: Dimension variance (properly sized boxes)
+    print("[3/7] Validating dimension variance...")
     dimension_variance = validate_dimension_variance(db_path, verbose)
 
     if dimension_variance.get('status') == 'CRITICAL':
@@ -880,8 +1021,8 @@ def validate_2dto3d_visualization(db_path: Path,
             details=dimension_variance
         ))
 
-    # Check 3: Complex parametric shapes (cylinders, detailed meshes)
-    print("[3/6] Validating complex parametric shapes...")
+    # Check 4: Complex parametric shapes (cylinders, detailed meshes)
+    print("[4/7] Validating complex parametric shapes...")
     parametric_shapes = validate_parametric_shapes(db_path, sample_size, verbose)
 
     # Note: This is now informational for 2Dto3D databases (boxes are OK if dimensioned)
@@ -906,8 +1047,8 @@ def validate_2dto3d_visualization(db_path: Path,
             details=parametric_shapes
         ))
 
-    # Check 4: Rotation distribution
-    print("[4/6] Analyzing rotation distribution...")
+    # Check 5: Rotation distribution
+    print("[5/7] Analyzing rotation distribution...")
     rotation_stats = analyze_rotation_distribution(db_path, verbose)
 
     if rotation_stats.get('rotation_quality') == 'CRITICAL':
@@ -933,8 +1074,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=rotation_stats
             ))
 
-    # Check 5: Preview mode readiness
-    print("[5/6] Checking Preview mode readiness...")
+    # Check 6: Preview mode readiness
+    print("[6/7] Checking Preview mode readiness...")
     preview_readiness = check_preview_mode_readiness(db_path, sample_size, verbose)
 
     if preview_readiness.get('status') == 'CRITICAL':
@@ -960,11 +1101,11 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=preview_readiness
             ))
 
-    # Check 6: Geometry quality (sample-based)
-    print(f"[6/6] Analyzing geometry quality (sample: {sample_size})...")
+    # Check 7: Geometry quality (sample-based)
+    print(f"[7/7] Analyzing geometry quality (sample: {sample_size})...")
     geometry_stats = analyze_geometry_quality(db_path, sample_size, verbose)
 
-    # Note: Simple boxes are now OK if dimensions vary (checked in step 2)
+    # Note: Simple boxes are now OK if dimensions vary (checked in step 3)
     if geometry_stats.get('placeholder_ratio', 0) > 0.5:
         issues.append(VisualizationIssue(
             guid="N/A",
@@ -987,7 +1128,8 @@ def validate_2dto3d_visualization(db_path: Path,
         preview_readiness=preview_readiness,
         discipline_colors=discipline_colors,
         parametric_shapes=parametric_shapes,
-        dimension_variance=dimension_variance
+        dimension_variance=dimension_variance,
+        material_assignments=material_assignments
     )
 
 
@@ -1073,6 +1215,23 @@ def generate_visualization_report(report: VisualizationReport) -> str:
         for name, info in sorted(disc['disciplines'].items(), key=lambda x: x[1]['count'], reverse=True):
             std_marker = "✓" if info['is_standard'] else "⚠"
             lines.append(f"    {std_marker} {name:20s}: {info['count']:5d} ({info['percentage']:5.1f}%)")
+
+    # Material assignments
+    lines.append("")
+    lines.append("MATERIAL ASSIGNMENT VALIDATION")
+    lines.append("-" * 70)
+    mats = report.material_assignments
+    lines.append(f"  Status: {mats.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {mats.get('message', 'N/A')}")
+    lines.append(f"  Coverage: {mats.get('elements_with_materials', 0)}/{mats.get('total_elements', 0)} ({mats.get('coverage_ratio', 0)*100:.1f}%)")
+
+    if mats.get('unique_materials', 0) > 0:
+        lines.append(f"  Unique Materials: {mats['unique_materials']}")
+        lines.append("\n  Material Distribution:")
+        for mat_name, mat_info in list(mats.get('materials', {}).items())[:10]:
+            color_marker = "✓" if mat_info['has_color'] else "✗"
+            rgba_display = mat_info['rgba'] if mat_info['rgba'] else "NO COLOR"
+            lines.append(f"    {color_marker} {mat_name:30s}: {mat_info['count']:4d} elements  [{rgba_display}]")
 
     # Dimension variance (NEW - most important for 2Dto3D!)
     lines.append("")
