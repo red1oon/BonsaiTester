@@ -54,6 +54,7 @@ class VisualizationReport:
     preview_readiness: Dict
     discipline_colors: Dict  # NEW: Discipline color validation
     parametric_shapes: Dict  # NEW: Proper shape validation
+    dimension_variance: Dict  # NEW: Dimension variance validation
 
 
 # ============================================================================
@@ -465,21 +466,163 @@ def validate_discipline_colors(db_path: Path, verbose: bool = False) -> Dict:
 
 
 # ============================================================================
+# DIMENSION VARIANCE VALIDATION
+# ============================================================================
+
+def validate_dimension_variance(db_path: Path, verbose: bool = False) -> Dict:
+    """
+    Validate that elements use real dimensions (not all 1.0m defaults).
+
+    This checks if the database has properly extracted dimensions from source data,
+    even if geometry is simple boxes. An 8-vertex box with varying dimensions
+    (0.15m, 2.5m, 7.77m) is better than all 1m cubes.
+
+    Returns:
+        Dictionary with dimension variance validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Check if element_transforms has dimension columns
+        cursor.execute("PRAGMA table_info(element_transforms)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        # Different schemas store dimensions differently
+        dimension_cols = []
+        if 'length' in columns:
+            dimension_cols.append('length')
+        if 'width' in columns:
+            dimension_cols.extend(['width', 'depth', 'height'])
+
+        if not dimension_cols:
+            return {
+                'status': 'SKIP',
+                'message': 'No dimension columns found in element_transforms',
+                'by_class': {}
+            }
+
+        # Analyze dimension variance by IFC class
+        results_by_class = {}
+
+        # Get all IFC classes
+        cursor.execute("SELECT DISTINCT ifc_class FROM elements_meta")
+        ifc_classes = [row[0] for row in cursor.fetchall()]
+
+        for ifc_class in ifc_classes:
+            # For each dimension column, check variance
+            class_stats = {}
+
+            for dim_col in dimension_cols:
+                cursor.execute(f"""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(DISTINCT t.{dim_col}) as unique_values,
+                        MIN(t.{dim_col}) as min_val,
+                        MAX(t.{dim_col}) as max_val,
+                        AVG(t.{dim_col}) as avg_val
+                    FROM element_transforms t
+                    JOIN elements_meta m ON t.guid = m.guid
+                    WHERE m.ifc_class = ?
+                """, (ifc_class,))
+
+                row = cursor.fetchone()
+                if row and row[0] > 0:
+                    total, unique, min_val, max_val, avg_val = row
+
+                    # Calculate variance ratio (unique values / total elements)
+                    variance_ratio = unique / total if total > 0 else 0
+
+                    # Check if all values are 1.0 (placeholder)
+                    is_placeholder = (unique == 1 and abs(min_val - 1.0) < 0.001)
+
+                    class_stats[dim_col] = {
+                        'total': total,
+                        'unique': unique,
+                        'min': min_val,
+                        'max': max_val,
+                        'avg': avg_val,
+                        'variance_ratio': variance_ratio,
+                        'is_placeholder': is_placeholder
+                    }
+
+            results_by_class[ifc_class] = class_stats
+
+        conn.close()
+
+        # Assess overall dimension quality
+        total_classes = len(results_by_class)
+        placeholder_classes = 0
+        good_variance_classes = 0
+
+        for ifc_class, stats in results_by_class.items():
+            if stats:
+                # Check first dimension column (usually 'length')
+                first_dim = list(stats.values())[0] if stats else None
+                if first_dim:
+                    if first_dim['is_placeholder']:
+                        placeholder_classes += 1
+                    elif first_dim['variance_ratio'] > 0.1:  # >10% unique values
+                        good_variance_classes += 1
+
+        # Determine status
+        if placeholder_classes == total_classes:
+            status = "CRITICAL"
+            message = "All elements use placeholder dimensions (all 1.0m)"
+        elif placeholder_classes > total_classes * 0.5:
+            status = "WARNING"
+            message = f"{placeholder_classes}/{total_classes} IFC classes use placeholder dimensions"
+        elif good_variance_classes > total_classes * 0.5:
+            status = "OK"
+            message = f"Good dimension variance: {good_variance_classes}/{total_classes} classes have varied dimensions"
+        else:
+            status = "WARNING"
+            message = "Limited dimension variance across IFC classes"
+
+        return {
+            'status': status,
+            'message': message,
+            'by_class': results_by_class,
+            'total_classes': total_classes,
+            'placeholder_classes': placeholder_classes,
+            'good_variance_classes': good_variance_classes,
+            'dimension_columns': dimension_cols
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'by_class': {},
+            'total_classes': 0,
+            'placeholder_classes': 0,
+            'good_variance_classes': 0,
+            'dimension_columns': []
+        }
+
+
+# ============================================================================
 # PARAMETRIC SHAPE VALIDATION
 # ============================================================================
 
 def validate_parametric_shapes(db_path: Path, sample_size: int = 100, verbose: bool = False) -> Dict:
     """
-    Validate that at least 2 elements have proper parametric shapes (not just boxes).
+    Validate complex parametric shapes (cylinders, detailed meshes, not just boxes).
+
+    NOTE: This validator checks for COMPLEX GEOMETRY (vertex count >8).
+    For dimension variance (properly sized boxes), use validate_dimension_variance().
 
     Checks for recognizable shapes:
     - Pipes/conduits: Cylindrical (12+ vertices in circular pattern)
-    - Doors/windows: Rectangular openings with depth
-    - Sprinklers: Cylindrical heads
-    - Taps/fittings: Complex shapes (20+ vertices)
+    - Columns: Cylindrical (24-32 vertices)
+    - Fittings: Complex shapes (20+ vertices)
+    - Equipment: Detailed meshes (100+ vertices)
+
+    An 8-vertex box with varying dimensions (0.15m, 7.77m) is GOOD for dimensions
+    but NOT counted as "complex parametric" by this validator.
 
     Returns:
-        Dictionary with parametric shape validation results
+        Dictionary with complex shape validation results
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -712,18 +855,44 @@ def validate_2dto3d_visualization(db_path: Path,
             details=discipline_colors
         ))
 
-    # Check 2: Parametric shapes
-    print("[2/5] Validating parametric shapes...")
+    # Check 2: Dimension variance (properly sized boxes)
+    print("[2/6] Validating dimension variance...")
+    dimension_variance = validate_dimension_variance(db_path, verbose)
+
+    if dimension_variance.get('status') == 'CRITICAL':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="NO_DIMENSION_VARIANCE",
+            severity="CRITICAL",
+            message=dimension_variance.get('message'),
+            details=dimension_variance
+        ))
+    elif dimension_variance.get('status') == 'WARNING':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="LIMITED_DIMENSION_VARIANCE",
+            severity="WARNING",
+            message=dimension_variance.get('message'),
+            details=dimension_variance
+        ))
+
+    # Check 3: Complex parametric shapes (cylinders, detailed meshes)
+    print("[3/6] Validating complex parametric shapes...")
     parametric_shapes = validate_parametric_shapes(db_path, sample_size, verbose)
 
+    # Note: This is now informational for 2Dto3D databases (boxes are OK if dimensioned)
     if parametric_shapes.get('status') == 'CRITICAL':
         issues.append(VisualizationIssue(
             guid="N/A",
             ifc_class="All",
             discipline="All",
-            issue_type="NO_PARAMETRIC_SHAPES",
-            severity="CRITICAL",
-            message=parametric_shapes.get('message'),
+            issue_type="NO_COMPLEX_SHAPES",
+            severity="INFO",  # Downgraded from CRITICAL
+            message=parametric_shapes.get('message') + " (boxes with real dimensions are acceptable)",
             details=parametric_shapes
         ))
     elif parametric_shapes.get('status') == 'WARNING':
@@ -731,14 +900,14 @@ def validate_2dto3d_visualization(db_path: Path,
             guid="N/A",
             ifc_class="All",
             discipline="All",
-            issue_type="FEW_PARAMETRIC_SHAPES",
-            severity="WARNING",
-            message=parametric_shapes.get('message'),
+            issue_type="FEW_COMPLEX_SHAPES",
+            severity="INFO",  # Downgraded from WARNING
+            message=parametric_shapes.get('message') + " (not critical if dimensions vary)",
             details=parametric_shapes
         ))
 
-    # Check 3: Rotation distribution
-    print("[3/5] Analyzing rotation distribution...")
+    # Check 4: Rotation distribution
+    print("[4/6] Analyzing rotation distribution...")
     rotation_stats = analyze_rotation_distribution(db_path, verbose)
 
     if rotation_stats.get('rotation_quality') == 'CRITICAL':
@@ -764,8 +933,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=rotation_stats
             ))
 
-    # Check 4: Preview mode readiness
-    print("[4/5] Checking Preview mode readiness...")
+    # Check 5: Preview mode readiness
+    print("[5/6] Checking Preview mode readiness...")
     preview_readiness = check_preview_mode_readiness(db_path, sample_size, verbose)
 
     if preview_readiness.get('status') == 'CRITICAL':
@@ -791,18 +960,19 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=preview_readiness
             ))
 
-    # Check 5: Geometry quality (sample-based)
-    print(f"[5/5] Analyzing geometry quality (sample: {sample_size})...")
+    # Check 6: Geometry quality (sample-based)
+    print(f"[6/6] Analyzing geometry quality (sample: {sample_size})...")
     geometry_stats = analyze_geometry_quality(db_path, sample_size, verbose)
 
+    # Note: Simple boxes are now OK if dimensions vary (checked in step 2)
     if geometry_stats.get('placeholder_ratio', 0) > 0.5:
         issues.append(VisualizationIssue(
             guid="N/A",
             ifc_class="All",
             discipline="All",
-            issue_type="PLACEHOLDER_GEOMETRY",
-            severity="WARNING",
-            message=f"{geometry_stats['placeholder_count']}/{geometry_stats['sampled']} elements are simple boxes (50%+)",
+            issue_type="SIMPLE_BOX_GEOMETRY",
+            severity="INFO",  # Downgraded from WARNING
+            message=f"{geometry_stats['placeholder_count']}/{geometry_stats['sampled']} elements are simple boxes (OK if dimensions vary)",
             details=geometry_stats
         ))
 
@@ -816,7 +986,8 @@ def validate_2dto3d_visualization(db_path: Path,
         geometry_stats=geometry_stats,
         preview_readiness=preview_readiness,
         discipline_colors=discipline_colors,
-        parametric_shapes=parametric_shapes
+        parametric_shapes=parametric_shapes,
+        dimension_variance=dimension_variance
     )
 
 
@@ -903,21 +1074,52 @@ def generate_visualization_report(report: VisualizationReport) -> str:
             std_marker = "✓" if info['is_standard'] else "⚠"
             lines.append(f"    {std_marker} {name:20s}: {info['count']:5d} ({info['percentage']:5.1f}%)")
 
-    # Parametric shapes
+    # Dimension variance (NEW - most important for 2Dto3D!)
     lines.append("")
-    lines.append("PARAMETRIC SHAPE VALIDATION")
+    lines.append("DIMENSION VARIANCE VALIDATION")
+    lines.append("-" * 70)
+    dims = report.dimension_variance
+    lines.append(f"  Status: {dims.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {dims.get('message', 'N/A')}")
+
+    if dims.get('dimension_columns'):
+        lines.append(f"  Dimension Columns: {', '.join(dims['dimension_columns'])}")
+
+    if dims.get('by_class'):
+        lines.append(f"\n  Classes with Good Variance: {dims.get('good_variance_classes', 0)}/{dims.get('total_classes', 0)}")
+        lines.append(f"  Classes with Placeholders: {dims.get('placeholder_classes', 0)}/{dims.get('total_classes', 0)}")
+
+        lines.append("\n  Top 5 Classes by Dimension Variance:")
+        # Sort by variance ratio
+        sorted_classes = sorted(
+            dims['by_class'].items(),
+            key=lambda x: list(x[1].values())[0].get('variance_ratio', 0) if x[1] else 0,
+            reverse=True
+        )[:5]
+
+        for ifc_class, stats in sorted_classes:
+            if stats:
+                first_dim_name = list(stats.keys())[0]
+                first_dim = stats[first_dim_name]
+                status_mark = "✓" if not first_dim['is_placeholder'] else "✗"
+                lines.append(f"    {status_mark} {ifc_class:30s}: {first_dim['unique']:3d} unique (min:{first_dim['min']:6.2f}m, max:{first_dim['max']:6.2f}m)")
+
+    # Complex parametric shapes (cylinders, etc.)
+    lines.append("")
+    lines.append("COMPLEX PARAMETRIC SHAPES (Cylinders, Detailed Meshes)")
     lines.append("-" * 70)
     shapes = report.parametric_shapes
     lines.append(f"  Status: {shapes.get('status', 'UNKNOWN')}")
     lines.append(f"  Message: {shapes.get('message', 'N/A')}")
-    lines.append(f"  Parametric Elements: {shapes.get('parametric_count', 0)} / {shapes.get('sample_size', 0)} ({shapes.get('parametric_ratio', 0)*100:.1f}%)")
-    lines.append(f"  Box Elements: {shapes.get('box_count', 0)}")
+    lines.append(f"  Complex Elements: {shapes.get('parametric_count', 0)} / {shapes.get('sample_size', 0)} ({shapes.get('parametric_ratio', 0)*100:.1f}%)")
+    lines.append(f"  Simple Box Elements: {shapes.get('box_count', 0)}")
+    lines.append("\n  NOTE: Simple boxes are acceptable if dimensions vary (see above)")
 
     if shapes.get('shape_types_found'):
-        lines.append(f"  Shape Types Found: {', '.join(shapes['shape_types_found'])}")
+        lines.append(f"\n  Complex Shape Types Found: {', '.join(shapes['shape_types_found'])}")
 
     if shapes.get('parametric_elements'):
-        lines.append("\n  Sample Parametric Elements:")
+        lines.append("\n  Sample Complex Elements:")
         for elem in shapes['parametric_elements'][:5]:
             lines.append(f"    - {elem['ifc_class']:25s} ({elem['discipline']:4s}): {elem['shape_type']:12s} [{elem['vertex_count']:3d} verts, {elem['confidence']:6s}]")
 
