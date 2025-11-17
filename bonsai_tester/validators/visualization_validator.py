@@ -56,6 +56,8 @@ class VisualizationReport:
     parametric_shapes: Dict  # NEW: Proper shape validation
     dimension_variance: Dict  # NEW: Dimension variance validation
     material_assignments: Dict  # NEW: Material assignment validation
+    preview_bbox_tightness: Dict  # NEW: Preview bbox tightness validation
+    dxf_accuracy: Dict  # NEW: DXF source validation
 
 
 # ============================================================================
@@ -467,6 +469,145 @@ def validate_discipline_colors(db_path: Path, verbose: bool = False) -> Dict:
 
 
 # ============================================================================
+# PREVIEW BBOX TIGHTNESS VALIDATION
+# ============================================================================
+
+def validate_preview_bbox_tightness(db_path: Path, sample_size: int = 100, verbose: bool = False) -> Dict:
+    """
+    Validate that Preview mode bounding boxes are tight-fitting (not bloated).
+
+    Preview mode displays elements_rtree bboxes. If these are bloated (much larger
+    than actual geometry), elements look blocky/oversized in Preview.
+
+    Smart minimal check:
+    - Samples random elements
+    - Compares rtree bbox to actual geometry bounds
+    - Reports bloat percentage
+    - Identifies which classes have bloated boxes
+
+    Returns:
+        Dictionary with bbox tightness validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Sample random elements with geometry and rtree data
+        cursor.execute("""
+            SELECT
+                m.ifc_class,
+                g.vertices,
+                r.minX, r.maxX,
+                r.minY, r.maxY,
+                r.minZ, r.maxZ
+            FROM base_geometries g
+            JOIN elements_meta m ON g.guid = m.guid
+            JOIN elements_rtree r ON m.id = r.id
+            ORDER BY RANDOM()
+            LIMIT ?
+        """, (sample_size,))
+
+        samples = cursor.fetchall()
+        conn.close()
+
+        tight_count = 0
+        bloated_count = 0
+        by_class = {}
+
+        for ifc_class, vertices_blob, minx, maxx, miny, maxy, minz, maxz in samples:
+            # Decode vertices
+            vertex_count = len(vertices_blob) // 12
+            vertices = []
+            for i in range(vertex_count):
+                offset = i * 12
+                x, y, z = struct.unpack('<fff', vertices_blob[offset:offset+12])
+                vertices.append((x, y, z))
+
+            # Actual geometry bounds
+            actual_minx = min(v[0] for v in vertices)
+            actual_maxx = max(v[0] for v in vertices)
+            actual_miny = min(v[1] for v in vertices)
+            actual_maxy = max(v[1] for v in vertices)
+            actual_minz = min(v[2] for v in vertices)
+            actual_maxz = max(v[2] for v in vertices)
+
+            # Calculate bloat
+            actual_width = actual_maxx - actual_minx
+            actual_depth = actual_maxy - actual_miny
+            actual_height = actual_maxz - actual_minz
+
+            bbox_width = maxx - minx
+            bbox_depth = maxy - miny
+            bbox_height = maxz - minz
+
+            width_bloat = (bbox_width / actual_width - 1) * 100 if actual_width > 0.001 else 0
+            depth_bloat = (bbox_depth / actual_depth - 1) * 100 if actual_depth > 0.001 else 0
+            height_bloat = (bbox_height / actual_height - 1) * 100 if actual_height > 0.001 else 0
+
+            avg_bloat = (width_bloat + depth_bloat + height_bloat) / 3
+
+            # Classify
+            if avg_bloat < 5:
+                tight_count += 1
+                is_tight = True
+            else:
+                bloated_count += 1
+                is_tight = False
+
+            # Track by class
+            if ifc_class not in by_class:
+                by_class[ifc_class] = {'tight': 0, 'bloated': 0, 'total': 0, 'avg_bloat': 0}
+
+            by_class[ifc_class]['total'] += 1
+            by_class[ifc_class]['avg_bloat'] += avg_bloat
+            if is_tight:
+                by_class[ifc_class]['tight'] += 1
+            else:
+                by_class[ifc_class]['bloated'] += 1
+
+        # Calculate averages
+        for ifc_class in by_class:
+            by_class[ifc_class]['avg_bloat'] /= by_class[ifc_class]['total']
+
+        # Determine status
+        bloat_ratio = bloated_count / len(samples) if samples else 0
+
+        if bloat_ratio == 0:
+            status = "OK"
+            message = "All Preview bboxes are tight-fitting"
+        elif bloat_ratio < 0.1:
+            status = "OK"
+            message = f"Preview bboxes mostly tight ({bloated_count}/{len(samples)} slightly bloated)"
+        elif bloat_ratio < 0.3:
+            status = "WARNING"
+            message = f"{bloated_count}/{len(samples)} Preview bboxes are bloated (elements look blocky)"
+        else:
+            status = "WARNING"
+            message = f"{bloated_count}/{len(samples)} Preview bboxes are bloated (Preview will look blocky)"
+
+        return {
+            'status': status,
+            'message': message,
+            'sample_size': len(samples),
+            'tight_count': tight_count,
+            'bloated_count': bloated_count,
+            'bloat_ratio': bloat_ratio,
+            'by_class': by_class
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'sample_size': 0,
+            'tight_count': 0,
+            'bloated_count': 0,
+            'bloat_ratio': 0,
+            'by_class': {}
+        }
+
+
+# ============================================================================
 # MATERIAL ASSIGNMENT VALIDATION
 # ============================================================================
 
@@ -724,6 +865,229 @@ def validate_dimension_variance(db_path: Path, verbose: bool = False) -> Dict:
             'placeholder_classes': 0,
             'good_variance_classes': 0,
             'dimension_columns': []
+        }
+
+
+# ============================================================================
+# DXF SOURCE VALIDATION
+# ============================================================================
+
+def validate_dxf_accuracy(db_path: Path, verbose: bool = False) -> Dict:
+    """
+    Validate database dimensions against original DXF source files.
+
+    Auto-detects DXF files in same folder or parent folder as database.
+    Compares extracted dimensions to verify accuracy.
+
+    Detects:
+    - Near-zero dimensions (extraction errors)
+    - All 1.0m placeholders (missing extraction)
+    - Out-of-range dimensions (invalid data)
+
+    Returns:
+        Dictionary with DXF validation results
+    """
+    try:
+        import ezdxf
+    except ImportError:
+        return {
+            'status': 'SKIP',
+            'message': 'ezdxf library not installed (pip install ezdxf)',
+            'dxf_files': [],
+            'accuracy': {}
+        }
+
+    # Auto-detect DXF files in same folder or parent folder
+    db_dir = db_path.parent
+    parent_dir = db_dir.parent
+
+    dxf_files = []
+
+    # Search in same folder
+    for dxf_path in db_dir.rglob("*.dxf"):
+        dxf_files.append(dxf_path)
+
+    # Search in parent folder and SourceFiles subfolder
+    if not dxf_files:
+        for search_dir in [parent_dir, parent_dir / "SourceFiles"]:
+            if search_dir.exists():
+                for dxf_path in search_dir.rglob("*.dxf"):
+                    dxf_files.append(dxf_path)
+
+    if not dxf_files:
+        return {
+            'status': 'SKIP',
+            'message': f'No DXF files found in {db_dir} or {parent_dir}',
+            'dxf_files': [],
+            'accuracy': {}
+        }
+
+    if verbose:
+        print(f"  Found {len(dxf_files)} DXF file(s):")
+        for dxf in dxf_files[:5]:  # Show first 5
+            print(f"    - {dxf.relative_to(parent_dir)}")
+
+    # Read database dimensions
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Check if element_transforms has dimension columns
+        cursor.execute("PRAGMA table_info(element_transforms)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if 'length' not in columns:
+            conn.close()
+            return {
+                'status': 'SKIP',
+                'message': 'No dimension columns found in element_transforms',
+                'dxf_files': [str(f) for f in dxf_files],
+                'accuracy': {}
+            }
+
+        # Get database dimensions by IFC class
+        cursor.execute("""
+            SELECT
+                m.ifc_class,
+                t.length,
+                COUNT(*) as count
+            FROM element_transforms t
+            JOIN elements_meta m ON t.guid = m.guid
+            WHERE t.length IS NOT NULL
+            GROUP BY m.ifc_class, t.length
+            ORDER BY m.ifc_class, count DESC
+        """)
+
+        db_dimensions = {}
+        for ifc_class, length, count in cursor.fetchall():
+            if ifc_class not in db_dimensions:
+                db_dimensions[ifc_class] = []
+            db_dimensions[ifc_class].append({
+                'length': length,
+                'count': count
+            })
+
+        conn.close()
+
+        # Extract DXF dimensions
+        dxf_dimensions = {}
+        dxf_errors = []
+
+        for dxf_file in dxf_files:
+            try:
+                doc = ezdxf.readfile(str(dxf_file))
+                msp = doc.modelspace()
+
+                # Extract LINE entities (walls)
+                for line in msp.query('LINE'):
+                    start = line.dxf.start
+                    end = line.dxf.end
+                    length = math.sqrt(
+                        (end.x - start.x)**2 +
+                        (end.y - start.y)**2 +
+                        (end.z - start.z)**2
+                    )
+
+                    if 'LINE' not in dxf_dimensions:
+                        dxf_dimensions['LINE'] = []
+                    dxf_dimensions['LINE'].append(length)
+
+                # Extract INSERT entities (blocks - doors, windows, equipment)
+                for insert in msp.query('INSERT'):
+                    block_name = insert.dxf.name
+
+                    # Try to get block dimensions
+                    if insert.has_attrib:
+                        # Check attributes for dimensions
+                        for attrib in insert.attribs:
+                            if 'WIDTH' in attrib.dxf.tag.upper() or 'LENGTH' in attrib.dxf.tag.upper():
+                                try:
+                                    dim_value = float(attrib.dxf.text)
+                                    if block_name not in dxf_dimensions:
+                                        dxf_dimensions[block_name] = []
+                                    dxf_dimensions[block_name].append(dim_value)
+                                except ValueError:
+                                    pass
+
+            except Exception as e:
+                dxf_errors.append(f"{dxf_file.name}: {e}")
+
+        # Compare database vs DXF dimensions
+        accuracy_report = {}
+
+        for ifc_class, db_dims in db_dimensions.items():
+            # Get database dimension range
+            db_lengths = [d['length'] for d in db_dims]
+            db_min = min(db_lengths)
+            db_max = max(db_lengths)
+            db_unique = len(set(db_lengths))
+
+            # Check for issues
+            issues = []
+
+            # Issue 1: Near-zero dimensions
+            near_zero = [l for l in db_lengths if abs(l) < 0.01]
+            if near_zero:
+                issues.append(f"{len(near_zero)} elements have near-zero dimensions (< 0.01m)")
+
+            # Issue 2: All 1.0m placeholders
+            all_one = all(abs(l - 1.0) < 0.001 for l in db_lengths)
+            if all_one:
+                issues.append(f"All {len(db_lengths)} elements are 1.0m (placeholder)")
+
+            # Issue 3: Out-of-range dimensions (too large)
+            too_large = [l for l in db_lengths if l > 50.0]
+            if too_large:
+                issues.append(f"{len(too_large)} elements have suspiciously large dimensions (> 50m)")
+
+            # Issue 4: Compare with DXF if available
+            dxf_match = None
+            if 'LINE' in dxf_dimensions and ifc_class in ['IfcWall', 'IfcWallStandardCase']:
+                dxf_lengths = dxf_dimensions['LINE']
+                dxf_min = min(dxf_lengths)
+                dxf_max = max(dxf_lengths)
+
+                # Check if database range matches DXF range (within 10%)
+                if abs(db_min - dxf_min) < dxf_min * 0.1 and abs(db_max - dxf_max) < dxf_max * 0.1:
+                    dxf_match = "GOOD"
+                else:
+                    dxf_match = "MISMATCH"
+                    issues.append(f"DXF range ({dxf_min:.2f}m - {dxf_max:.2f}m) != DB range ({db_min:.2f}m - {db_max:.2f}m)")
+
+            accuracy_report[ifc_class] = {
+                'db_min': db_min,
+                'db_max': db_max,
+                'db_unique': db_unique,
+                'db_count': sum(d['count'] for d in db_dims),
+                'issues': issues,
+                'dxf_match': dxf_match,
+                'status': 'CRITICAL' if issues else 'OK'
+            }
+
+        # Overall status
+        critical_classes = [c for c, r in accuracy_report.items() if r['status'] == 'CRITICAL']
+
+        if critical_classes:
+            status = "WARNING"
+            message = f"{len(critical_classes)}/{len(accuracy_report)} classes have dimension issues"
+        else:
+            status = "OK"
+            message = "All dimensions appear reasonable"
+
+        return {
+            'status': status,
+            'message': message,
+            'dxf_files': [str(f.relative_to(parent_dir)) for f in dxf_files],
+            'dxf_errors': dxf_errors,
+            'accuracy': accuracy_report
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'dxf_files': [str(f) for f in dxf_files],
+            'accuracy': {}
         }
 
 
@@ -1007,7 +1371,7 @@ def validate_2dto3d_visualization(db_path: Path,
         ))
 
     # Check 3: Dimension variance (properly sized boxes)
-    print("[3/7] Validating dimension variance...")
+    print("[3/8] Validating dimension variance...")
     dimension_variance = validate_dimension_variance(db_path, verbose)
 
     if dimension_variance.get('status') == 'CRITICAL':
@@ -1031,8 +1395,26 @@ def validate_2dto3d_visualization(db_path: Path,
             details=dimension_variance
         ))
 
-    # Check 4: Complex parametric shapes (cylinders, detailed meshes)
-    print("[4/7] Validating complex parametric shapes...")
+    # Check 4: DXF source validation (compare with original DXF)
+    print("[4/8] Validating against DXF source...")
+    dxf_accuracy = validate_dxf_accuracy(db_path, verbose)
+
+    if dxf_accuracy.get('status') == 'WARNING':
+        for ifc_class, report in dxf_accuracy.get('accuracy', {}).items():
+            if report['status'] == 'CRITICAL':
+                for issue_msg in report['issues']:
+                    issues.append(VisualizationIssue(
+                        guid="N/A",
+                        ifc_class=ifc_class,
+                        discipline="All",
+                        issue_type="DXF_DIMENSION_MISMATCH",
+                        severity="WARNING",
+                        message=issue_msg,
+                        details=report
+                    ))
+
+    # Check 5: Complex parametric shapes (cylinders, detailed meshes)
+    print("[5/8] Validating complex parametric shapes...")
     parametric_shapes = validate_parametric_shapes(db_path, sample_size, verbose)
 
     # Note: This is now informational for 2Dto3D databases (boxes are OK if dimensioned)
@@ -1057,8 +1439,8 @@ def validate_2dto3d_visualization(db_path: Path,
             details=parametric_shapes
         ))
 
-    # Check 5: Rotation distribution
-    print("[5/7] Analyzing rotation distribution...")
+    # Check 6: Rotation distribution
+    print("[6/8] Analyzing rotation distribution...")
     rotation_stats = analyze_rotation_distribution(db_path, verbose)
 
     if rotation_stats.get('rotation_quality') == 'CRITICAL':
@@ -1084,8 +1466,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=rotation_stats
             ))
 
-    # Check 6: Preview mode readiness
-    print("[6/7] Checking Preview mode readiness...")
+    # Check 7: Preview mode readiness
+    print("[7/8] Checking Preview mode readiness...")
     preview_readiness = check_preview_mode_readiness(db_path, sample_size, verbose)
 
     if preview_readiness.get('status') == 'CRITICAL':
@@ -1111,8 +1493,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=preview_readiness
             ))
 
-    # Check 7: Geometry quality (sample-based)
-    print(f"[7/7] Analyzing geometry quality (sample: {sample_size})...")
+    # Check 8: Geometry quality (sample-based)
+    print(f"[8/8] Analyzing geometry quality (sample: {sample_size})...")
     geometry_stats = analyze_geometry_quality(db_path, sample_size, verbose)
 
     # Note: Simple boxes are now OK if dimensions vary (checked in step 3)
@@ -1139,7 +1521,9 @@ def validate_2dto3d_visualization(db_path: Path,
         discipline_colors=discipline_colors,
         parametric_shapes=parametric_shapes,
         dimension_variance=dimension_variance,
-        material_assignments=material_assignments
+        material_assignments=material_assignments,
+        preview_bbox_tightness={},  # Placeholder for future use
+        dxf_accuracy=dxf_accuracy
     )
 
 
@@ -1276,6 +1660,37 @@ def generate_visualization_report(report: VisualizationReport) -> str:
                 first_dim = stats[first_dim_name]
                 status_mark = "✓" if not first_dim['is_placeholder'] else "✗"
                 lines.append(f"    {status_mark} {ifc_class:30s}: {first_dim['unique']:3d} unique (min:{first_dim['min']:6.2f}m, max:{first_dim['max']:6.2f}m)")
+
+    # DXF source validation (NEW!)
+    lines.append("")
+    lines.append("DXF SOURCE VALIDATION")
+    lines.append("-" * 70)
+    dxf = report.dxf_accuracy
+    lines.append(f"  Status: {dxf.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {dxf.get('message', 'N/A')}")
+
+    if dxf.get('dxf_files'):
+        lines.append(f"\n  DXF Files Found: {len(dxf['dxf_files'])}")
+        for dxf_file in dxf['dxf_files'][:3]:  # Show first 3
+            lines.append(f"    - {dxf_file}")
+
+    if dxf.get('dxf_errors'):
+        lines.append(f"\n  DXF Read Errors: {len(dxf['dxf_errors'])}")
+        for error in dxf['dxf_errors'][:3]:
+            lines.append(f"    ⚠ {error}")
+
+    if dxf.get('accuracy'):
+        lines.append("\n  Dimension Accuracy by Class:")
+        for ifc_class, acc in sorted(dxf['accuracy'].items(), key=lambda x: len(x[1].get('issues', [])), reverse=True):
+            status_mark = "✓" if acc['status'] == 'OK' else "⚠"
+            lines.append(f"    {status_mark} {ifc_class:30s}: {acc['db_unique']:3d} unique ({acc['db_min']:.2f}m - {acc['db_max']:.2f}m)")
+
+            if acc.get('dxf_match'):
+                lines.append(f"       DXF Match: {acc['dxf_match']}")
+
+            if acc.get('issues'):
+                for issue in acc['issues'][:2]:  # Show first 2 issues per class
+                    lines.append(f"       ⚠ {issue}")
 
     # Complex parametric shapes (cylinders, etc.)
     lines.append("")
