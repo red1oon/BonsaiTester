@@ -486,6 +486,35 @@ def validate_geometry_blob(guid: str,
                 message=f"Bbox size valid: {bbox_size[0]:.2f}×{bbox_size[1]:.2f}×{bbox_size[2]:.2f}m"
             ))
 
+        # Validation 6b: Preview cube anomaly check (non-critical warning)
+        # Check if bbox is suspiciously cube-like (all dimensions equal)
+        # This can indicate incorrect preview geometry generation
+        if min_dim > 0.001:  # Only check if bbox is valid
+            w, d, h = bbox_size
+            # Calculate aspect ratios
+            tolerance = 0.05  # 5% tolerance for "equal" dimensions
+            avg_dim = (w + d + h) / 3
+
+            # Check if all dimensions are within 5% of each other (cube-like)
+            w_diff = abs(w - avg_dim) / avg_dim if avg_dim > 0 else 0
+            d_diff = abs(d - avg_dim) / avg_dim if avg_dim > 0 else 0
+            h_diff = abs(h - avg_dim) / avg_dim if avg_dim > 0 else 0
+
+            is_cube_like = (w_diff < tolerance and d_diff < tolerance and h_diff < tolerance)
+
+            if is_cube_like and max_dim > 0.01:  # Only flag cubes larger than 1cm
+                results.append(ValidationResult(
+                    passed=False,
+                    message=f"Preview cube anomaly: bbox is suspiciously cube-like ({w:.3f}×{d:.3f}×{h:.3f}m, ratio ~1:1:1)"
+                ))
+            elif verbose:
+                # Pass - bbox has reasonable aspect ratio
+                ratio_str = f"{w/min_dim:.1f}:{d/min_dim:.1f}:{h/min_dim:.1f}"
+                results.append(ValidationResult(
+                    passed=True,
+                    message=f"Bbox aspect ratio OK: {ratio_str}"
+                ))
+
         # Validation 7: Expected dimensions (if provided)
         if expected_bbox:
             expected_w, expected_d, expected_h = expected_bbox

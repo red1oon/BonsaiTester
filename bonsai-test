@@ -28,6 +28,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from bonsai_tester.validators.geometry_validator import validate_database_geometries
+from bonsai_tester.validators.schema_validator import validate_database_schema
+from bonsai_tester.logger import BonsaiLogger, HTMLReportGenerator
+from bonsai_tester.repair import repair_database
 
 
 def main():
@@ -66,6 +69,8 @@ Tiers:
                        help='Print detailed validation results')
     parser.add_argument('--json', action='store_true',
                        help='Output results in JSON format (for GUI/scripting)')
+    parser.add_argument('--repair', action='store_true',
+                       help='Auto-repair degenerate faces (creates <db>_repaired.db)')
     parser.add_argument('--version', action='version', version='BonsaiTester 0.1.0')
 
     args = parser.parse_args()
@@ -107,11 +112,79 @@ Tiers:
 
     # Run tests based on mode
     if mode == 'fast':
-        print("\n[Tier 1: Schema Validation] - NOT YET IMPLEMENTED")
-        print("Coming soon: Database schema and integrity checks")
-        return 0
+        # Initialize logger
+        logger = None
+        if not args.json:
+            logger = BonsaiLogger(args.database, mode='fast')
+            logger.log_section("[Tier 1: Schema Validation]")
+
+        # Run schema validation
+        results = validate_database_schema(args.database, verbose=args.verbose)
+        elapsed = time.time() - start_time
+
+        # JSON output mode
+        if args.json:
+            output = {
+                'mode': 'fast',
+                'database': str(args.database),
+                'schema_type': results['schema_type'],
+                'results': results,
+                'success': results['failed'] == 0
+            }
+            print(json.dumps(output, indent=2))
+            return 0 if results['failed'] == 0 else 1
+
+        # Normal text output
+        print(f"\n{'=' * 70}")
+        print("SCHEMA VALIDATION SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"Schema Type: {results['schema_type']}")
+        print(f"✓ Passed: {results['passed']}")
+        print(f"✗ Failed: {results['failed']}")
+        print(f"Time: {elapsed:.1f} seconds")
+        print(f"{'=' * 70}")
+
+        # Log results
+        if logger:
+            logger.log_section("SCHEMA VALIDATION SUMMARY", to_console=False)
+            logger.log(f"Schema Type: {results['schema_type']}", to_console=False)
+            logger.log(f"✓ Passed: {results['passed']}", to_console=False)
+            logger.log(f"✗ Failed: {results['failed']}", to_console=False)
+
+            for check in results['checks']:
+                status = "✓" if check['passed'] else "✗"
+                logger.log(f"  {status} {check['name']}: {check['message']}", to_console=False)
+
+        if results['failed'] > 0:
+            print(f"\n❌ SCHEMA VALIDATION FAILED")
+            print("\nFailed checks:")
+            for check in results['checks']:
+                if not check['passed']:
+                    print(f"  ✗ {check['name']}: {check['message']}")
+
+            if logger:
+                logger.log_section("TEST RESULT: FAILED", to_console=False)
+                logger.close()
+                print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
+
+            return 1
+        else:
+            print("\n✅ ALL SCHEMA CHECKS PASSED")
+
+            if logger:
+                logger.log_section("TEST RESULT: PASSED", to_console=False)
+                logger.close()
+                print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
+
+            return 0
 
     elif mode == 'geometry':
+        # Initialize logger (logs saved to DB directory)
+        logger = None
+        if not args.json:
+            logger = BonsaiLogger(args.database, mode='geometry')
+            logger.log_section("[Tier 2: Geometry Validation]")
+
         # Run validation
         results = validate_database_geometries(
             args.database,
@@ -135,9 +208,7 @@ Tiers:
             print(json.dumps(output, indent=2))
             return 0 if results['failed'] == 0 else 1
 
-        # Normal text output
-        print("\n[Tier 2: Geometry Validation]")
-
+        # Normal text output with logging
         print(f"\n{'=' * 70}")
         print("VALIDATION SUMMARY")
         print(f"{'=' * 70}")
@@ -148,6 +219,17 @@ Tiers:
         print(f"Time: {elapsed:.1f} seconds")
         print(f"{'=' * 70}")
 
+        # Log results
+        if logger:
+            logger.log_section("VALIDATION SUMMARY", to_console=False)
+            logger.log_results(results, to_console=False)
+
+        # Generate HTML report
+        if logger:
+            html_gen = HTMLReportGenerator(args.database, results, elapsed, mode='geometry')
+            html_path = html_gen.generate()
+            logger.log(f"\n📊 HTML report generated: logs/{html_path.name}", to_console=True)
+
         if results['failed'] > 0:
             print(f"\n❌ VALIDATION FAILED - {results['failed']} geometry errors")
             print("\nFirst 10 failures:")
@@ -155,9 +237,43 @@ Tiers:
                 print(f"  • {failure['guid']}:")
                 for msg in failure['failures']:
                     print(f"    └─ {msg}")
+
+            # Auto-repair if requested
+            if args.repair:
+                print(f"\n{'=' * 70}")
+                print("AUTO-REPAIR MODE")
+                print(f"{'=' * 70}")
+
+                repair_results = repair_database(args.database, verbose=args.verbose)
+
+                print(f"\nRepair complete:")
+                print(f"  Elements repaired: {repair_results['repaired_elements']:,}")
+                print(f"  Faces removed: {repair_results['total_faces_removed']:,}")
+                print(f"  Output: {Path(repair_results['output_path']).name}")
+
+                if logger:
+                    logger.log_section("AUTO-REPAIR APPLIED", to_console=False)
+                    logger.log(f"Elements repaired: {repair_results['repaired_elements']:,}", to_console=False)
+                    logger.log(f"Faces removed: {repair_results['total_faces_removed']:,}", to_console=False)
+                    logger.log(f"Output: {repair_results['output_path']}", to_console=False)
+
+                print(f"\n💡 Re-run validation on repaired database:")
+                print(f"   ./bonsai-test {Path(repair_results['output_path']).name}")
+
+            if logger:
+                logger.log_section("TEST RESULT: FAILED", to_console=False)
+                logger.close()
+                print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
+
             return 1
         else:
             print("\n✅ ALL GEOMETRIES VALID")
+
+            if logger:
+                logger.log_section("TEST RESULT: PASSED", to_console=False)
+                logger.close()
+                print(f"📝 Full log saved to: logs/{logger.get_log_path().name}")
+
             return 0
 
     elif mode == 'full':

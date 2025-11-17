@@ -1,0 +1,50 @@
+================================================================
+BONSAITESTER LOGS ORGANIZATION
+================================================================
+
+All BonsaiTester results are now saved in a dedicated 'logs/' 
+subdirectory within the database's directory.
+
+STRUCTURE:
+----------
+For any database at: /path/to/database.db
+
+Test results are saved to: /path/to/logs/
+  ├── bonsai_test_database_YYYYMMDD_HHMMSS.log   (detailed text log)
+  └── bonsai_test_database_YYYYMMDD_HHMMSS.html  (professional HTML report)
+
+EXAMPLE:
+--------
+Database: ~/Documents/bonsai/2Dto3D/Terminal1_MainBuilding_FILTERED.db
+
+Results saved to:
+  ~/Documents/bonsai/2Dto3D/logs/
+    ├── bonsai_test_Terminal1_MainBuilding_FILTERED_20251117_082745.log
+    └── bonsai_test_Terminal1_MainBuilding_FILTERED_20251117_082745.html
+
+BENEFITS:
+---------
+✓ All test results in one easy-to-find location
+✓ No clutter in database directory
+✓ Easy to compare test results over time
+✓ Timestamp-based filenames prevent overwrites
+✓ Both text logs (.log) and visual reports (.html)
+
+CURRENT STATUS:
+---------------
+✓ 2Dto3D database logs organized in: ~/Documents/bonsai/2Dto3D/logs/
+✓ 8_IFC database logs organized in: ~/Documents/bonsai/8_IFC/logs/
+✓ All existing test results moved to logs/ folders
+
+USAGE:
+------
+Simply run BonsaiTester normally:
+  ./bonsai-test database.db
+
+Results automatically saved to database_directory/logs/
+
+The tool will always display the path in output:
+  📊 HTML report generated: logs/bonsai_test_database_YYYYMMDD_HHMMSS.html
+  📝 Full log saved to: logs/bonsai_test_database_YYYYMMDD_HHMMSS.log
+
+================================================================
