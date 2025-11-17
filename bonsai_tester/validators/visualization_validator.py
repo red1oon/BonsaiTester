@@ -54,7 +54,8 @@ class VisualizationReport:
     preview_readiness: Dict
     discipline_colors: Dict  # NEW: Discipline color validation
     parametric_shapes: Dict  # NEW: Proper shape validation
-    dimension_variance: Dict  # NEW: Dimension variance validation
+    dimension_variance: Dict  # NEW: Dimension variance validation (element_transforms)
+    bbox_diversity: Dict  # NEW: Bbox diversity validation (elements_rtree - Preview mode!)
     material_assignments: Dict  # NEW: Material assignment validation
     preview_bbox_tightness: Dict  # NEW: Preview bbox tightness validation
     dxf_accuracy: Dict  # NEW: DXF source validation
@@ -869,6 +870,129 @@ def validate_dimension_variance(db_path: Path, verbose: bool = False) -> Dict:
 
 
 # ============================================================================
+# BBOX DIVERSITY VALIDATION (Preview Mode)
+# ============================================================================
+
+def validate_bbox_diversity(db_path: Path, verbose: bool = False) -> Dict:
+    """
+    Validate bounding box diversity in elements_rtree (Preview mode data).
+
+    CRITICAL: This checks the ACTUAL data used by Blender Preview mode!
+    Preview mode reads from elements_rtree, NOT element_transforms.
+
+    Checks if elements have unique bbox dimensions (not all identical placeholders).
+    A diverse bbox distribution means Preview mode will show varied geometry.
+
+    Returns:
+        Dictionary with bbox diversity validation results
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    try:
+        # Check if elements_rtree exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='elements_rtree'
+        """)
+
+        if not cursor.fetchone():
+            conn.close()
+            return {
+                'status': 'SKIP',
+                'message': 'No elements_rtree table found',
+                'by_class': {}
+            }
+
+        # Get bbox diversity by IFC class
+        cursor.execute("""
+            SELECT
+                m.ifc_class,
+                COUNT(*) as total,
+                COUNT(DISTINCT
+                    r.minx || ',' || r.miny || ',' || r.minz || ',' ||
+                    r.maxx || ',' || r.maxy || ',' || r.maxz
+                ) as unique_bboxes
+            FROM elements_rtree r
+            JOIN elements_meta m ON r.id = m.id
+            GROUP BY m.ifc_class
+            ORDER BY total DESC
+        """)
+
+        results_by_class = {}
+        total_elements = 0
+        total_unique = 0
+
+        for ifc_class, total, unique_bboxes in cursor.fetchall():
+            diversity_ratio = unique_bboxes / total if total > 0 else 0
+
+            results_by_class[ifc_class] = {
+                'total': total,
+                'unique_bboxes': unique_bboxes,
+                'diversity_ratio': diversity_ratio,
+                'diversity_pct': diversity_ratio * 100,
+                'is_placeholder': unique_bboxes == 1  # All same bbox = placeholder
+            }
+
+            total_elements += total
+            if diversity_ratio > 0.1:  # At least 10% diversity
+                total_unique += 1
+
+        conn.close()
+
+        # Overall diversity count
+        cursor = sqlite3.connect(db_path).cursor()
+        cursor.execute("""
+            SELECT COUNT(DISTINCT
+                minx || ',' || miny || ',' || minz || ',' ||
+                maxx || ',' || maxy || ',' || maxz
+            )
+            FROM elements_rtree
+        """)
+        overall_unique = cursor.fetchone()[0]
+
+        # Assess status
+        total_classes = len(results_by_class)
+        placeholder_classes = sum(1 for r in results_by_class.values() if r['is_placeholder'])
+        good_diversity_classes = total_classes - placeholder_classes
+
+        if placeholder_classes == total_classes:
+            status = "CRITICAL"
+            message = "All classes have identical bboxes (placeholder geometry)"
+        elif placeholder_classes > total_classes / 2:
+            status = "WARNING"
+            message = f"Poor bbox diversity: {placeholder_classes}/{total_classes} classes have identical bboxes"
+        else:
+            status = "OK"
+            message = f"Good bbox diversity: {good_diversity_classes}/{total_classes} classes have varied bboxes"
+
+        if verbose:
+            print(f"  Overall unique bboxes: {overall_unique}/{total_elements} ({overall_unique/total_elements*100:.1f}%)")
+            print(f"  Classes with good diversity: {good_diversity_classes}/{total_classes}")
+
+        return {
+            'status': status,
+            'message': message,
+            'overall_unique_bboxes': overall_unique,
+            'total_elements': total_elements,
+            'by_class': results_by_class,
+            'total_classes': total_classes,
+            'placeholder_classes': placeholder_classes,
+            'good_diversity_classes': good_diversity_classes
+        }
+
+    except sqlite3.Error as e:
+        return {
+            'status': 'ERROR',
+            'message': f"Database error: {e}",
+            'by_class': {},
+            'total_classes': 0,
+            'placeholder_classes': 0,
+            'good_diversity_classes': 0
+        }
+
+
+# ============================================================================
 # DXF SOURCE VALIDATION
 # ============================================================================
 
@@ -1370,8 +1494,8 @@ def validate_2dto3d_visualization(db_path: Path,
             details=material_assignments
         ))
 
-    # Check 3: Dimension variance (properly sized boxes)
-    print("[3/8] Validating dimension variance...")
+    # Check 3: Dimension variance (element_transforms - for wall lengths, etc.)
+    print("[3/9] Validating dimension variance (element_transforms)...")
     dimension_variance = validate_dimension_variance(db_path, verbose)
 
     if dimension_variance.get('status') == 'CRITICAL':
@@ -1395,8 +1519,33 @@ def validate_2dto3d_visualization(db_path: Path,
             details=dimension_variance
         ))
 
-    # Check 4: DXF source validation (compare with original DXF)
-    print("[4/8] Validating against DXF source...")
+    # Check 4: Bbox diversity (elements_rtree - CRITICAL for Preview mode!)
+    print("[4/9] Validating bbox diversity (Preview mode)...")
+    bbox_diversity = validate_bbox_diversity(db_path, verbose)
+
+    if bbox_diversity.get('status') == 'CRITICAL':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="NO_BBOX_DIVERSITY",
+            severity="CRITICAL",
+            message=bbox_diversity.get('message'),
+            details=bbox_diversity
+        ))
+    elif bbox_diversity.get('status') == 'WARNING':
+        issues.append(VisualizationIssue(
+            guid="N/A",
+            ifc_class="All",
+            discipline="All",
+            issue_type="LIMITED_BBOX_DIVERSITY",
+            severity="WARNING",
+            message=bbox_diversity.get('message'),
+            details=bbox_diversity
+        ))
+
+    # Check 5: DXF source validation (compare with original DXF)
+    print("[5/9] Validating against DXF source...")
     dxf_accuracy = validate_dxf_accuracy(db_path, verbose)
 
     if dxf_accuracy.get('status') == 'WARNING':
@@ -1413,8 +1562,8 @@ def validate_2dto3d_visualization(db_path: Path,
                         details=report
                     ))
 
-    # Check 5: Complex parametric shapes (cylinders, detailed meshes)
-    print("[5/8] Validating complex parametric shapes...")
+    # Check 6: Complex parametric shapes (cylinders, detailed meshes)
+    print("[6/9] Validating complex parametric shapes...")
     parametric_shapes = validate_parametric_shapes(db_path, sample_size, verbose)
 
     # Note: This is now informational for 2Dto3D databases (boxes are OK if dimensioned)
@@ -1439,8 +1588,8 @@ def validate_2dto3d_visualization(db_path: Path,
             details=parametric_shapes
         ))
 
-    # Check 6: Rotation distribution
-    print("[6/8] Analyzing rotation distribution...")
+    # Check 7: Rotation distribution
+    print("[7/9] Analyzing rotation distribution...")
     rotation_stats = analyze_rotation_distribution(db_path, verbose)
 
     if rotation_stats.get('rotation_quality') == 'CRITICAL':
@@ -1466,8 +1615,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=rotation_stats
             ))
 
-    # Check 7: Preview mode readiness
-    print("[7/8] Checking Preview mode readiness...")
+    # Check 8: Preview mode readiness
+    print("[8/9] Checking Preview mode readiness...")
     preview_readiness = check_preview_mode_readiness(db_path, sample_size, verbose)
 
     if preview_readiness.get('status') == 'CRITICAL':
@@ -1493,8 +1642,8 @@ def validate_2dto3d_visualization(db_path: Path,
                 details=preview_readiness
             ))
 
-    # Check 8: Geometry quality (sample-based)
-    print(f"[8/8] Analyzing geometry quality (sample: {sample_size})...")
+    # Check 9: Geometry quality (sample-based)
+    print(f"[9/9] Analyzing geometry quality (sample: {sample_size})...")
     geometry_stats = analyze_geometry_quality(db_path, sample_size, verbose)
 
     # Note: Simple boxes are now OK if dimensions vary (checked in step 3)
@@ -1521,6 +1670,7 @@ def validate_2dto3d_visualization(db_path: Path,
         discipline_colors=discipline_colors,
         parametric_shapes=parametric_shapes,
         dimension_variance=dimension_variance,
+        bbox_diversity=bbox_diversity,
         material_assignments=material_assignments,
         preview_bbox_tightness={},  # Placeholder for future use
         dxf_accuracy=dxf_accuracy
@@ -1660,6 +1810,38 @@ def generate_visualization_report(report: VisualizationReport) -> str:
                 first_dim = stats[first_dim_name]
                 status_mark = "✓" if not first_dim['is_placeholder'] else "✗"
                 lines.append(f"    {status_mark} {ifc_class:30s}: {first_dim['unique']:3d} unique (min:{first_dim['min']:6.2f}m, max:{first_dim['max']:6.2f}m)")
+
+    # Bbox diversity (CRITICAL for Preview mode!)
+    lines.append("")
+    lines.append("BBOX DIVERSITY VALIDATION (Preview Mode - elements_rtree)")
+    lines.append("-" * 70)
+    bbox = report.bbox_diversity
+    lines.append(f"  Status: {bbox.get('status', 'UNKNOWN')}")
+    lines.append(f"  Message: {bbox.get('message', 'N/A')}")
+
+    if bbox.get('overall_unique_bboxes'):
+        total = bbox.get('total_elements', 0)
+        unique = bbox.get('overall_unique_bboxes', 0)
+        pct = (unique / total * 100) if total > 0 else 0
+        lines.append(f"\n  Overall Bbox Diversity: {unique}/{total} ({pct:.1f}% unique)")
+        lines.append(f"  Classes with Good Diversity: {bbox.get('good_diversity_classes', 0)}/{bbox.get('total_classes', 0)}")
+        lines.append(f"  Classes with Placeholders: {bbox.get('placeholder_classes', 0)}/{bbox.get('total_classes', 0)}")
+
+    if bbox.get('by_class'):
+        lines.append("\n  Bbox Diversity by IFC Class:")
+        # Sort by total elements
+        sorted_classes = sorted(
+            bbox['by_class'].items(),
+            key=lambda x: x[1]['total'],
+            reverse=True
+        )[:10]  # Show top 10 classes
+
+        for ifc_class, stats in sorted_classes:
+            status_mark = "✓" if not stats['is_placeholder'] else "✗"
+            lines.append(f"    {status_mark} {ifc_class:30s}: {stats['unique_bboxes']:4d}/{stats['total']:4d} unique ({stats['diversity_pct']:.1f}%)")
+
+    lines.append("\n  NOTE: This is the ACTUAL data used by Preview mode!")
+    lines.append("        100% unique bboxes = Perfect diversity for Preview mode")
 
     # DXF source validation (NEW!)
     lines.append("")
